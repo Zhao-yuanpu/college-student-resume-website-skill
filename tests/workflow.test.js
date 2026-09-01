@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -141,4 +141,62 @@ test("apply_patch rejects stale snapshots", async (t) => {
   await writeFile(join(root, "other.txt"), "changed\n");
   const result = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "execute", approvalToken: preview.approvalToken, confirm: "WRITE" });
   assert.equal(result.ok, false);
+});
+
+test("apply_patch expires approvals and consumes failed execute attempts", async (t) => {
+  const root = await fixtureRepo(t);
+  let clock = 0;
+  const workflow = createWorkflow({ now: () => clock, randomUUIDImpl: () => "approval" });
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "preview" });
+  clock = 300_001;
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "execute", approvalToken: preview.approvalToken, confirm: "WRITE" })).ok, false);
+  clock = 0;
+  const fresh = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "preview" });
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "execute", approvalToken: fresh.approvalToken, confirm: "write" })).ok, false);
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "execute", approvalToken: fresh.approvalToken, confirm: "WRITE" })).ok, false);
+});
+
+test("apply_patch binds approvals to arguments and branches", async (t) => {
+  const root = await fixtureRepo(t);
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "preview" });
+  const differentPatch = readmePatch.replace("Serve index.html locally.", "Open the site locally.");
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: differentPatch, allowedPaths: ["README.md"], mode: "execute", approvalToken: preview.approvalToken, confirm: "WRITE" })).ok, false);
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "execute", approvalToken: preview.approvalToken, confirm: "WRITE" })).ok, false);
+  const branchPreview = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "preview" });
+  await execFileAsync("git", ["checkout", "-b", "other"], { cwd: root });
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "execute", approvalToken: branchPreview.approvalToken, confirm: "WRITE" })).ok, false);
+});
+
+test("apply_patch rejects absolute paths and supports quoted rename paths", async (t) => {
+  const root = await fixtureRepo(t);
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const absolute = join(root, "outside.txt").replaceAll("\\", "/");
+  const absolutePatch = `diff --git a/${absolute} b/${absolute}\n--- a/${absolute}\n+++ b/${absolute}\n@@ -0,0 +1 @@\n+blocked\n`;
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: absolutePatch, allowedPaths: [absolute], mode: "preview" })).ok, false);
+  await execFileAsync("git", ["mv", "README.md", "README renamed.md"], { cwd: root });
+  const { stdout } = await execFileAsync("git", ["diff", "--cached", "-M"], { cwd: root });
+  const renamePatch = stdout.replace("diff --git a/README.md b/README renamed.md", 'diff --git "a/README.md" "b/README renamed.md"');
+  await execFileAsync("git", ["reset", "--hard"], { cwd: root });
+  const renamePreview = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: renamePatch, allowedPaths: ["README.md", "README renamed.md"], mode: "preview" });
+  assert.equal(renamePreview.ok, true, renamePreview.summary);
+});
+
+test("apply_patch requires both copy paths in allowedPaths", async (t) => {
+  const root = await fixtureRepo(t);
+  await writeFile(join(root, "copy source.md"), "copy\n");
+  await execFileAsync("git", ["add", "copy source.md"], { cwd: root });
+  await execFileAsync("git", ["commit", "-m", "copy source"], { cwd: root });
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  await copyFile(join(root, "copy source.md"), join(root, "copy target.md"));
+  await execFileAsync("git", ["add", "copy target.md"], { cwd: root });
+  const { stdout } = await execFileAsync("git", ["diff", "--cached", "-C", "--find-copies-harder"], { cwd: root });
+  const copyPatch = stdout.replace("diff --git a/copy source.md b/copy target.md", 'diff --git "a/copy source.md" "b/copy target.md"');
+  await execFileAsync("git", ["reset", "--hard"], { cwd: root });
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: copyPatch, allowedPaths: ["copy target.md"], mode: "preview" })).ok, false);
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: copyPatch, allowedPaths: ["copy source.md", "copy target.md"], mode: "preview" })).ok, true);
 });

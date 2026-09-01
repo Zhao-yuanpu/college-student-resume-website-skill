@@ -113,13 +113,56 @@ function hashJson(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+function gitPathToken(input, start) {
+  if (input[start] === '"') {
+    let path = "";
+    for (let index = start + 1; index < input.length; index += 1) {
+      if (input[index] === '"') return { path, next: index + 1 };
+      if (input[index] !== "\\") {
+        path += input[index];
+        continue;
+      }
+      const escape = input[++index];
+      if (escape === undefined) break;
+      const escaped = { a: "\u0007", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v" }[escape];
+      if (escaped !== undefined) path += escaped;
+      else if (/[0-7]/.test(escape)) {
+        const octal = `${escape}${input[index + 1] ?? ""}${input[index + 2] ?? ""}`;
+        if (!/^[0-7]{3}$/.test(octal)) break;
+        path += String.fromCharCode(Number.parseInt(octal, 8));
+        index += 2;
+      } else if (escape === "\\" || escape === '"') path += escape;
+      else throw new Error("Patch contains an invalid quoted file path");
+    }
+    throw new Error("Patch contains an invalid quoted file path");
+  }
+  const end = input.indexOf(" ", start);
+  return { path: input.slice(start, end === -1 ? input.length : end), next: end === -1 ? input.length : end };
+}
+
 function patchPaths(patch) {
   const paths = [];
   for (const line of patch.split("\n")) {
     if (!line.startsWith("diff --git ")) continue;
-    const match = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
-    if (!match || match[1] !== match[2]) throw new Error("Patch contains an invalid file path");
-    paths.push(match[1]);
+    const input = line.slice("diff --git ".length);
+    let oldPath;
+    let newPath;
+    if (input.startsWith('"')) {
+      oldPath = gitPathToken(input, 0);
+      const rest = input.slice(oldPath.next + 1);
+      if (input[oldPath.next] !== " ") throw new Error("Patch contains an invalid file path");
+      const parsedNewPath = rest.startsWith('"') ? gitPathToken(rest, 0) : null;
+      newPath = parsedNewPath ? parsedNewPath.path : rest;
+      if (!newPath || (parsedNewPath && rest.slice(parsedNewPath.next).trim())) throw new Error("Patch contains an invalid file path");
+      oldPath = oldPath.path;
+    } else {
+      const separator = input.indexOf(" b/");
+      if (separator === -1) throw new Error("Patch contains an invalid file path");
+      oldPath = input.slice(0, separator);
+      newPath = input.slice(separator + 1);
+    }
+    if (!oldPath.startsWith("a/") || !newPath.startsWith("b/")) throw new Error("Patch contains an invalid file path");
+    paths.push(oldPath.slice(2), newPath.slice(2));
   }
   if (!paths.length) throw new Error("Patch does not contain file paths");
   return [...new Set(paths)].sort();
@@ -156,14 +199,16 @@ async function assertInsideRoot(repoRoot, path) {
 }
 
 function equalSnapshot(expected, actual) {
-  return expected && normalized(expected.repoRoot) === normalized(actual.repoRoot) && expected.head === actual.head && expected.statusHash === actual.statusHash;
+  return expected && normalized(expected.repoRoot) === normalized(actual.repoRoot) && expected.head === actual.head && expected.branch === actual.branch && expected.statusHash === actual.statusHash;
 }
 
 function approvalBinding(current, patch, allowedPaths) {
-  return { repoRoot: normalized(current.repoRoot), head: current.head, statusHash: current.statusHash, patchHash: createHash("sha256").update(patch).digest("hex"), allowedPaths: [...allowedPaths].sort() };
+  return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, patchHash: createHash("sha256").update(patch).digest("hex"), allowedPaths: [...allowedPaths].sort() };
 }
 
 async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, allowedPaths, mode, approvalToken, confirm }, { run, now, randomUUIDImpl, approvals }) {
+  const approval = mode === "execute" ? approvals.get(approvalToken) : null;
+  if (mode === "execute") approvals.delete(approvalToken);
   try {
     const current = await snapshot(run, projectPath);
     if (!equalSnapshot(requestedSnapshot, current)) throw new Error("Snapshot is stale");
@@ -180,8 +225,6 @@ async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, all
       return { ok: true, phase: "patch", summary: `Patch is ready for ${paths.join(", ")}`, evidence: paths, approvalToken: token, nextAction: "Execute with confirm: WRITE" };
     }
     if (mode !== "execute" || confirm !== "WRITE") throw new Error("Execution requires confirm: WRITE");
-    const approval = approvals.get(approvalToken);
-    approvals.delete(approvalToken);
     if (!approval || approval.operation !== "apply_patch" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
     await git(run, current.repoRoot, ["apply", "--check", "--whitespace=error-all", "-"], { input: patch });
     await git(run, current.repoRoot, ["apply", "--whitespace=error-all", "-"], { input: patch });

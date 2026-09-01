@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile, readdir } from "node:fs/promises";
-import { extname, join, relative } from "node:path";
+import { readFile, readdir, realpath } from "node:fs/promises";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const ignoredDirectories = new Set([".git", "node_modules", "dist", "build"]);
 const binaryExtensions = new Set([".7z", ".avif", ".bmp", ".class", ".dll", ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".lock", ".mp3", ".mp4", ".pdf", ".png", ".rar", ".tar", ".ttf", ".wasm", ".webp", ".woff", ".woff2", ".zip"]);
@@ -109,9 +109,94 @@ async function inspectProject({ projectPath }, { run }) {
   }
 }
 
+function hashJson(value) {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function patchPaths(patch) {
+  const paths = [];
+  for (const line of patch.split("\n")) {
+    if (!line.startsWith("diff --git ")) continue;
+    const match = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+    if (!match || match[1] !== match[2]) throw new Error("Patch contains an invalid file path");
+    paths.push(match[1]);
+  }
+  if (!paths.length) throw new Error("Patch does not contain file paths");
+  return [...new Set(paths)].sort();
+}
+
+function safePath(path) {
+  const normalizedPath = normalized(path);
+  if (!path || path.includes("\0") || isAbsolute(path) || normalizedPath.startsWith("/") || normalizedPath.split("/").some((part) => part === "" || part === "." || part === "..")) {
+    throw new Error("Patch path must be a relative path without traversal");
+  }
+  const lower = normalizedPath.toLowerCase();
+  const name = lower.split("/").at(-1);
+  if (lower.split("/").includes(".git") || (name.startsWith(".env") && name !== ".env.example") || /\.(pem|key)$/.test(name) || /(credential|password|secret|token|id_rsa)/.test(name)) {
+    throw new Error("Patch path is protected");
+  }
+  return normalizedPath;
+}
+
+async function assertInsideRoot(repoRoot, path) {
+  const root = await realpath(repoRoot);
+  let candidate = resolve(root, path);
+  while (true) {
+    try {
+      const resolved = await realpath(candidate);
+      if (resolved !== root && !resolved.startsWith(`${root}${sep}`)) throw new Error("Patch path escapes the repository");
+      return;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const parent = resolve(candidate, "..");
+      if (parent === candidate) throw error;
+      candidate = parent;
+    }
+  }
+}
+
+function equalSnapshot(expected, actual) {
+  return expected && normalized(expected.repoRoot) === normalized(actual.repoRoot) && expected.head === actual.head && expected.statusHash === actual.statusHash;
+}
+
+function approvalBinding(current, patch, allowedPaths) {
+  return { repoRoot: normalized(current.repoRoot), head: current.head, statusHash: current.statusHash, patchHash: createHash("sha256").update(patch).digest("hex"), allowedPaths: [...allowedPaths].sort() };
+}
+
+async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, allowedPaths, mode, approvalToken, confirm }, { run, now, randomUUIDImpl, approvals }) {
+  try {
+    const current = await snapshot(run, projectPath);
+    if (!equalSnapshot(requestedSnapshot, current)) throw new Error("Snapshot is stale");
+    const paths = patchPaths(patch).map(safePath);
+    const allowed = allowedPaths.map(safePath).sort();
+    if (new Set(allowed).size !== allowed.length) throw new Error("allowedPaths must not contain duplicates");
+    if (paths.length !== allowed.length || paths.some((path, index) => path !== allowed[index])) throw new Error("Patch paths must exactly match allowedPaths");
+    for (const path of paths) await assertInsideRoot(current.repoRoot, path);
+    await git(run, current.repoRoot, ["apply", "--check", "--whitespace=error-all", "-"], { input: patch });
+    const binding = approvalBinding(current, patch, allowed);
+    if (mode === "preview") {
+      const token = randomUUIDImpl();
+      approvals.set(token, { operation: "apply_patch", bindingHash: hashJson(binding), expiresAt: now() + 5 * 60 * 1000 });
+      return { ok: true, phase: "patch", summary: `Patch is ready for ${paths.join(", ")}`, evidence: paths, approvalToken: token, nextAction: "Execute with confirm: WRITE" };
+    }
+    if (mode !== "execute" || confirm !== "WRITE") throw new Error("Execution requires confirm: WRITE");
+    const approval = approvals.get(approvalToken);
+    approvals.delete(approvalToken);
+    if (!approval || approval.operation !== "apply_patch" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
+    await git(run, current.repoRoot, ["apply", "--check", "--whitespace=error-all", "-"], { input: patch });
+    await git(run, current.repoRoot, ["apply", "--whitespace=error-all", "-"], { input: patch });
+    const fresh = await snapshot(run, current.repoRoot);
+    return { ok: true, phase: "patch", summary: `Applied patch to ${paths.join(", ")}`, evidence: paths, snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
+  } catch (error) {
+    return { ok: false, phase: "patch", summary: `Could not apply patch: ${error.message}`, evidence: [], nextAction: "Preview a valid, allowed patch" };
+  }
+}
+
 export function createWorkflow({ run = runCommand, fetchImpl = globalThis.fetch, now = Date.now, randomUUIDImpl = randomUUID } = {}) {
   void fetchImpl;
-  void now;
-  void randomUUIDImpl;
-  return { inspectProject: (input) => inspectProject(input, { run }) };
+  const approvals = new Map();
+  return {
+    inspectProject: (input) => inspectProject(input, { run }),
+    applyPatch: (input) => applyPatch(input, { run, now, randomUUIDImpl, approvals })
+  };
 }

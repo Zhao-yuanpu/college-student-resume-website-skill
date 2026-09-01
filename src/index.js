@@ -22,6 +22,18 @@ export function createServer(workflow) {
     description: "Inspect a student portfolio repository and return a safe workflow snapshot.",
     inputSchema: { projectPath: z.string().min(1) }
   }, async (input) => toToolResult(await workflow.inspectProject(input)));
+  server.registerTool("apply_patch", {
+    description: "Preview and apply a guarded unified patch to explicit project paths.",
+    inputSchema: {
+      projectPath: z.string().min(1),
+      snapshot: z.object({ repoRoot: z.string(), head: z.string(), branch: z.string(), statusHash: z.string() }),
+      patch: z.string().min(1),
+      allowedPaths: z.array(z.string().min(1)).min(1),
+      mode: z.enum(["preview", "execute"]),
+      approvalToken: z.string().optional(),
+      confirm: z.string().optional()
+    }
+  }, async (input) => toToolResult(await workflow.applyPatch(input)));
   return server;
 }
 

@@ -35,6 +35,14 @@ test("inspect_project reports repository and evidence without personal text", as
   assert.equal(JSON.stringify(result).includes("证书编号"), false);
 });
 
+test("inspect_project rejects a repository without a commit", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "portfolio-mcp-unborn-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await execFileAsync("git", ["init", "-b", "main"], { cwd: root });
+  const result = await createWorkflow().inspectProject({ projectPath: root });
+  assert.equal(result.ok, false);
+});
+
 test("MCP stdio lists inspect_project", async () => {
   const published = process.env.MCP_SMOKE_PACKAGE;
   const command = published ? (process.platform === "win32" ? "npm.cmd" : "npm") : process.execPath;

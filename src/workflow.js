@@ -47,7 +47,9 @@ export function runCommand(command, args, { input, timeoutMs = 30_000, maxOutput
 }
 
 async function git(run, repoRoot, args, options = {}) {
-  return run("git", ["-C", repoRoot, ...args], options);
+  const result = await run("git", ["-C", repoRoot, ...args], options);
+  if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
+  return result;
 }
 
 function normalized(path) {

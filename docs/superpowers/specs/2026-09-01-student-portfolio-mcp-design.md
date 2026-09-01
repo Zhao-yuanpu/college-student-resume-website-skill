@@ -31,6 +31,7 @@ src/workflow.js
 tests/workflow.test.js
 package.json
 package-lock.json
+.gitignore
 README.md
 LICENSE
 building-student-portfolio-websites/SKILL.md

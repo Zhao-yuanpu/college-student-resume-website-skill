@@ -1,0 +1,27 @@
+{
+  "name": "student-portfolio-website-mcp",
+  "version": "1.0.0",
+  "description": "Guarded MCP workflow for student portfolio and resume websites",
+  "type": "module",
+  "bin": {
+    "student-portfolio-website-mcp": "src/index.js"
+  },
+  "files": [
+    "src",
+    "building-student-portfolio-websites",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.5.4"
+  }
+}

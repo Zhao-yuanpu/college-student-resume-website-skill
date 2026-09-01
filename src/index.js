@@ -84,7 +84,11 @@ export function createServer(workflow) {
 
 async function main() {
   if (process.argv.includes("--help")) {
-    process.stdout.write("Usage: student-portfolio-website-mcp [--help] [--version]\n");
+    process.stdout.write(`Usage: student-portfolio-website-mcp [--help] [--version]
+
+Tools: inspect_project, apply_patch, run_checks, commit_changes, push_changes, verify_github_pages
+Confirmations: WRITE (apply_patch), RUN (run_checks), COMMIT (commit_changes), PUSH (push_changes)
+`);
     return;
   }
   if (process.argv.includes("--version")) {

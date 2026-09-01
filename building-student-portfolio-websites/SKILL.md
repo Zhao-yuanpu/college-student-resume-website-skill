@@ -9,6 +9,10 @@ description: Use when building or improving a student portfolio or personal resu
 
 把用户确认的内容与设计稿当作视觉事实，把实际文件树当作技术事实。先查证，再做最小改动；编辑、提交、推送和部署是不同权限。
 
+## MCP 工具
+
+当 `inspect_project`、`apply_patch`、`run_checks`、`commit_changes`、`push_changes` 和 `verify_github_pages` 可用时，优先使用它们执行本 skill 的受控工作流。每次写入先预览，获得对应阶段授权后再执行；MCP 不替代设计判断，也不扩大用户对编辑、提交、推送或部署的授权。
+
 ## 开始前
 
 1. 定位真正的 Git 仓库、入口文件、构建脚本、生成产物和部署方式；不要根据外层文件夹名猜路径。

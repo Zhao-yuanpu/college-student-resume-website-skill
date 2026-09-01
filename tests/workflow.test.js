@@ -11,6 +11,18 @@ import { createWorkflow, runCommand } from "../src/workflow.js";
 
 const execFileAsync = promisify(execFile);
 
+test("CLI help lists the guarded workflow tools and confirmations", async () => {
+  const { stdout } = await execFileAsync(process.execPath, ["src/index.js", "--help"], { cwd: process.cwd() });
+  for (const value of ["inspect_project", "apply_patch", "run_checks", "commit_changes", "push_changes", "verify_github_pages", "WRITE", "RUN", "COMMIT", "PUSH"]) {
+    assert.match(stdout, new RegExp(`\\b${value}\\b`));
+  }
+});
+
+test("CLI version reads package metadata", async () => {
+  const { stdout } = await execFileAsync(process.execPath, ["src/index.js", "--version"], { cwd: process.cwd() });
+  assert.equal(stdout, "1.0.0\n");
+});
+
 async function fixtureRepo(t) {
   const root = await mkdtemp(join(tmpdir(), "portfolio-mcp-"));
   t.after(() => rm(root, { recursive: true, force: true }));

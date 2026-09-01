@@ -1,63 +1,98 @@
-# 大学生个人简历网站 Skill
+# Student Portfolio Website MCP
 
-这是一个面向 Codex 的网页制作 skill，用于构建或优化大学生个人简历、作品集与个人主页。
+`student-portfolio-website-mcp` is a local stdio MCP server for safely working on student portfolio and resume websites. It keeps design judgment with your agent and user, while it inspects projects and performs explicitly approved Git and package-script steps.
 
-它总结了真实项目中最容易被忽略的部分：严格对照已确认设计、保护个人信息、精准修改 React 与动效代码、兼容桌面和手机、保留键盘与减少动态效果支持，以及安全完成 Git 和 GitHub Pages 交付。
+## Prerequisites
 
-## 仓库结构
+- Node.js 18 or later, npm, Git, and an MCP-capable host.
+- The target is a local Git repository. GitHub CLI is optional for GitHub Pages build-status checks.
 
-```text
-building-student-portfolio-websites/
-└── SKILL.md
-```
-
-## 安装
-
-### 方式一：让 Codex 安装
-
-在 Codex 中发送：
-
-```text
-请从 https://github.com/Zhao-yuanpu/college-student-resume-website-skill 安装 building-student-portfolio-websites skill。
-```
-
-### 方式二：Windows 手动安装
-
-在 PowerShell 中执行：
+Run without installing globally:
 
 ```powershell
-git clone "https://github.com/Zhao-yuanpu/college-student-resume-website-skill.git"
+npx -y student-portfolio-website-mcp
+```
 
-$skillRoot = Join-Path $env:USERPROFILE ".codex\skills"
-$skillTarget = Join-Path $skillRoot "building-student-portfolio-websites"
+Or install it globally:
 
-New-Item -ItemType Directory -Force -Path $skillRoot | Out-Null
-if (Test-Path -LiteralPath $skillTarget) {
-    throw "目标 skill 已存在：$skillTarget"
+```powershell
+npm install -g student-portfolio-website-mcp
+student-portfolio-website-mcp
+```
+
+## Tools and safety
+
+The server exposes exactly six tools:
+
+- `inspect_project` — read a repository snapshot, package scripts, and constraint paths.
+- `apply_patch` — validate and apply a unified patch to explicit paths.
+- `run_checks` — run only named `package.json` scripts.
+- `commit_changes` — stage and commit only explicit changed paths.
+- `push_changes` — normally push the current configured branch and remote.
+- `verify_github_pages` — read-only verification of branch, Pages state, and an optional public URL.
+
+`apply_patch`, `run_checks`, `commit_changes`, and `push_changes` always use preview then execute. A preview returns a short-lived token bound to the current repository state and request. Execution also requires the exact confirmation: `WRITE`, `RUN`, `COMMIT`, or `PUSH` respectively. Tokens expire on changes or restart; no arbitrary commands, force pushes, credential files, or Git internals are supported.
+
+The MCP host approval prompt remains the final authority. The server never authenticates npm or GitHub Pages: use your host, npm, Git, and GitHub CLI sign-in flows where needed.
+
+## Connect a host
+
+### Codex
+
+```powershell
+codex mcp add student-portfolio -- npx -y student-portfolio-website-mcp
+```
+
+See [Codex MCP documentation](https://developers.openai.com/codex/mcp/).
+
+### Claude Code
+
+```powershell
+claude mcp add --transport stdio student-portfolio -- npx -y student-portfolio-website-mcp
+```
+
+See [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
+
+### Pi
+
+Install the adapter:
+
+```powershell
+pi install npm:pi-mcp-adapter
+```
+
+Then create this project-level `.mcp.json` and restart Pi after installing the adapter:
+
+```json
+{
+  "mcpServers": {
+    "student-portfolio": {
+      "command": "npx",
+      "args": ["-y", "student-portfolio-website-mcp"]
+    }
+  }
 }
-
-Copy-Item -Recurse -LiteralPath ".\college-student-resume-website-skill\building-student-portfolio-websites" -Destination $skillTarget
 ```
 
-安装后，该 skill 会在 Codex 的下一轮对话中可用。
+See [Pi MCP Adapter](https://github.com/nicobailon/pi-mcp-adapter).
 
-## 使用
+### DeepSeek Harness
 
-可以显式调用：
+Add this row to the active Harness profile or overlay:
 
-```text
-使用 $building-student-portfolio-websites，按我确认的设计稿优化这个个人简历网站。先检查现有项目并给出方案，得到同意后再修改。
+```yaml
+- id: mcp-student-portfolio
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: student_portfolio
+    transport: stdio
+    command: npx
+    args: ['-y', 'student-portfolio-website-mcp']
+    toolCallTimeoutMs: 120000
 ```
 
-也可以直接描述需求；当任务涉及学生个人网站、简历网站、已确认视觉稿、响应式动效或 GitHub Pages 交付时，Codex 可以自动选择它。
+DeepSeek Harness exposes these as `mcp__student_portfolio__*`. See the [DeepSeek Harness official MCP client](https://github.com/deepseek-ai/deepseek-harness/blob/main/packages/mcp/mcp-client/README.md).
 
-## 主要能力
+## Optional skill
 
-- 在编码前定位真实仓库、文件结构、内容证据与隐私边界
-- 忠实实现已确认设计，避免无依据的通用装饰
-- 精准处理 React、Anime.js、GSAP 或 Three.js 动效
-- 验证桌面、390px 手机、键盘、触屏和减少动态效果
-- 区分编辑、提交、推送与部署权限
-- 验证 GitHub Pages 构建状态和线上内容
-
-本仓库只提供工作方法，不包含个人简历资料、证书、联系方式或原网站源码。
+Clients that support skills can also install `building-student-portfolio-websites/SKILL.md`. It supplies the project-specific judgment around confirmed designs, privacy, responsive motion, and separate edit/commit/push/deployment authority; the MCP tools carry out the guarded operations when available.

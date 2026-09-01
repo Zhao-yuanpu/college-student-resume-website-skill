@@ -19,7 +19,12 @@ async function fixtureRepo(t) {
   await execFileAsync("git", ["config", "user.email", "mcp@example.invalid"], { cwd: root });
   await writeFile(join(root, "README.md"), "Open index.html directly.\n");
   await writeFile(join(root, "direction-approved.md"), "隐私：遮挡证书编号。\n");
-  await writeFile(join(root, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+  await writeFile(join(root, "package.json"), JSON.stringify({ scripts: {
+    test: "node --test",
+    "test:fixture": "node -e \"require('node:fs').writeFileSync('checked.txt','ok')\"",
+    "hang:fixture": "node -e \"setTimeout(() => {}, 5000)\"",
+    "redact:fixture": "node -e \"console.log('TOKEN=secret-value')\""
+  } }));
   await execFileAsync("git", ["add", "README.md", "direction-approved.md", "package.json"], { cwd: root });
   await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: root });
   return root;
@@ -30,7 +35,7 @@ test("inspect_project reports repository and evidence without personal text", as
   const result = await createWorkflow().inspectProject({ projectPath: root });
   assert.equal(result.ok, true);
   assert.equal(result.snapshot.repoRoot, root.replaceAll("\\", "/"));
-  assert.deepEqual(result.packageScripts, ["test"]);
+  assert.deepEqual(result.packageScripts, ["hang:fixture", "redact:fixture", "test", "test:fixture"]);
   assert.ok(result.evidence.some((item) => item.path === "direction-approved.md"));
   assert.equal(JSON.stringify(result).includes("证书编号"), false);
 });
@@ -43,7 +48,7 @@ test("inspect_project rejects a repository without a commit", async (t) => {
   assert.equal(result.ok, false);
 });
 
-test("MCP stdio lists inspect_project and apply_patch", async () => {
+test("MCP stdio lists inspect_project, apply_patch, and run_checks", async () => {
   const published = process.env.MCP_SMOKE_PACKAGE;
   const command = published ? (process.platform === "win32" ? "npm.cmd" : "npm") : process.execPath;
   const args = published
@@ -53,7 +58,7 @@ test("MCP stdio lists inspect_project and apply_patch", async () => {
   const transport = new StdioClientTransport({ command, args });
   await client.connect(transport);
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch"]);
+  assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch", "run_checks"]);
   await client.close();
 });
 
@@ -214,4 +219,37 @@ test("apply_patch decodes quoted UTF-8 paths without accepting mojibake", async 
   await execFileAsync("git", ["reset", "--hard"], { cwd: root });
   assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: unicodePatch, allowedPaths: [filename], mode: "preview" })).ok, true);
   assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: unicodePatch, allowedPaths: ["æµ‹è¯•.md"], mode: "preview" })).ok, false);
+});
+
+test("run_checks previews allowlisted scripts and executes once with RUN approval", async (t) => {
+  const root = await fixtureRepo(t);
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  assert.equal((await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["deploy"], mode: "preview" })).ok, false);
+  const preview = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "preview" });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.deepEqual(preview.evidence, [{ script: "test:fixture", command: "npm run test:fixture" }]);
+  assert.equal((await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "execute", approvalToken: preview.approvalToken, confirm: "run" })).ok, false);
+  const previewAgain = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "preview" });
+  const executed = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "execute", approvalToken: previewAgain.approvalToken, confirm: "RUN" });
+  assert.equal(executed.ok, true);
+  assert.equal((await readFile(join(root, "checked.txt"), "utf8")), "ok");
+  assert.notEqual(executed.snapshot.statusHash, inspected.snapshot.statusHash);
+  assert.equal((await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "execute", approvalToken: previewAgain.approvalToken, confirm: "RUN" })).ok, false);
+});
+
+test("run_checks rejects duplicates, times out, stops on failure, and redacts output", async (t) => {
+  const root = await fixtureRepo(t);
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  assert.equal((await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: [], mode: "preview" })).ok, false);
+  assert.equal((await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test", "test"], mode: "preview" })).ok, false);
+  const redact = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["redact:fixture"], mode: "preview" });
+  const redacted = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["redact:fixture"], mode: "execute", approvalToken: redact.approvalToken, confirm: "RUN" });
+  assert.equal(redacted.ok, true, JSON.stringify(redacted));
+  assert.match(redacted.evidence[0].stdout, /TOKEN=\[REDACTED\]/);
+  const fresh = await workflow.inspectProject({ projectPath: root });
+  const timeout = await workflow.runChecks({ projectPath: root, snapshot: fresh.snapshot, scripts: ["hang:fixture"], mode: "preview" });
+  const timedOut = await workflow.runChecks({ projectPath: root, snapshot: fresh.snapshot, scripts: ["hang:fixture"], mode: "execute", approvalToken: timeout.approvalToken, confirm: "RUN", timeoutSeconds: 0.05 });
+  assert.equal(timedOut.ok, false);
 });

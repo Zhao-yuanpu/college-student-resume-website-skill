@@ -7,9 +7,12 @@ const ignoredDirectories = new Set([".git", "node_modules", "dist", "build"]);
 const binaryExtensions = new Set([".7z", ".avif", ".bmp", ".class", ".dll", ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".lock", ".mp3", ".mp4", ".pdf", ".png", ".rar", ".tar", ".ttf", ".wasm", ".webp", ".woff", ".woff2", ".zip"]);
 const maxTextFileSize = 256 * 1024;
 
-export function runCommand(command, args, { input, timeoutMs = 30_000, maxOutputBytes = 1_048_576 } = {}) {
+export function runCommand(command, args, { cwd, input, timeoutMs = 30_000, maxOutputBytes = 1_048_576 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
+    const isWindowsCommandScript = process.platform === "win32" && command.endsWith(".cmd");
+    const child = isWindowsCommandScript
+      ? spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/c", command, ...args], { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] })
+      : spawn(command, args, { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let outputBytes = 0;
@@ -24,6 +27,7 @@ export function runCommand(command, args, { input, timeoutMs = 30_000, maxOutput
     };
     const timer = setTimeout(() => {
       timedOut = true;
+      if (process.platform === "win32") spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { shell: false, stdio: "ignore" });
       child.kill();
     }, timeoutMs);
 
@@ -44,6 +48,10 @@ export function runCommand(command, args, { input, timeoutMs = 30_000, maxOutput
     if (input !== undefined) child.stdin.end(input);
     else child.stdin.end();
   });
+}
+
+function redact(output) {
+  return output.replace(/\b(token|password|secret|key)\b\s*([=:])\s*("[^"]*"|'[^']*'|[^\s]+)/gi, "$1$2[REDACTED]");
 }
 
 async function git(run, repoRoot, args, options = {}) {
@@ -213,6 +221,10 @@ function approvalBinding(current, patch, allowedPaths) {
   return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, patchHash: createHash("sha256").update(patch).digest("hex"), allowedPaths: [...allowedPaths].sort() };
 }
 
+function runChecksBinding(current, scripts) {
+  return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, scripts };
+}
+
 async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, allowedPaths, mode, approvalToken, confirm }, { run, now, randomUUIDImpl, approvals }) {
   const approval = mode === "execute" ? approvals.get(approvalToken) : null;
   if (mode === "execute") approvals.delete(approvalToken);
@@ -242,11 +254,51 @@ async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, all
   }
 }
 
+async function runChecks({ projectPath, snapshot: requestedSnapshot, scripts, mode, approvalToken, confirm, timeoutSeconds = 120 }, { run, now, randomUUIDImpl, approvals }) {
+  const approval = mode === "execute" ? approvals.get(approvalToken) : null;
+  if (mode === "execute") approvals.delete(approvalToken);
+  const evidence = [];
+  try {
+    const current = await snapshot(run, projectPath);
+    if (!equalSnapshot(requestedSnapshot, current)) throw new Error("Snapshot is stale");
+    if (!Array.isArray(scripts) || scripts.length === 0 || new Set(scripts).size !== scripts.length || scripts.some((script) => typeof script !== "string" || !script)) throw new Error("scripts must be a non-empty duplicate-free list");
+    const packageJson = JSON.parse(await readFile(join(current.repoRoot, "package.json"), "utf8"));
+    const available = packageJson.scripts ?? {};
+    if (scripts.some((script) => !Object.hasOwn(available, script))) throw new Error("Requested script is not defined in package.json");
+    const binding = runChecksBinding(current, scripts);
+    if (mode === "preview") {
+      const token = randomUUIDImpl();
+      approvals.set(token, { operation: "run_checks", bindingHash: hashJson(binding), expiresAt: now() + 5 * 60 * 1000 });
+      return { ok: true, phase: "checks", summary: `Checks are ready: ${scripts.join(", ")}`, evidence: scripts.map((script) => ({ script, command: `npm run ${script}` })), approvalToken: token, nextAction: "Execute with confirm: RUN" };
+    }
+    if (mode !== "execute" || confirm !== "RUN") throw new Error("Execution requires confirm: RUN");
+    if (!approval || approval.operation !== "run_checks" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
+    if (typeof timeoutSeconds !== "number" || timeoutSeconds <= 0) throw new Error("timeoutSeconds must be positive");
+    const timeoutMs = Math.min(timeoutSeconds * 1000, 120_000);
+    const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+    for (const script of scripts) {
+      try {
+        const result = await run(npmCommand, ["run", script], { cwd: current.repoRoot, timeoutMs, maxOutputBytes: 64 * 1024 });
+        evidence.push({ script, exitCode: result.exitCode ?? result.code, stdout: redact(result.stdout ?? ""), stderr: redact(result.stderr ?? "") });
+        if ((result.exitCode ?? result.code) !== 0) return { ok: false, phase: "checks", summary: `Check failed: ${script}`, evidence, nextAction: "Fix the first failing script and preview again" };
+      } catch (error) {
+        evidence.push({ script, exitCode: null, stdout: "", stderr: redact(error.message) });
+        return { ok: false, phase: "checks", summary: `Check failed: ${script}`, evidence, nextAction: "Fix the first failing script and preview again" };
+      }
+    }
+    const fresh = await snapshot(run, current.repoRoot);
+    return { ok: true, phase: "checks", summary: `Completed ${scripts.length} check${scripts.length === 1 ? "" : "s"}`, evidence, snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
+  } catch (error) {
+    return { ok: false, phase: "checks", summary: `Could not run checks: ${error.message}`, evidence, nextAction: "Preview only package scripts from a fresh snapshot" };
+  }
+}
+
 export function createWorkflow({ run = runCommand, fetchImpl = globalThis.fetch, now = Date.now, randomUUIDImpl = randomUUID } = {}) {
   void fetchImpl;
   const approvals = new Map();
   return {
     inspectProject: (input) => inspectProject(input, { run }),
-    applyPatch: (input) => applyPatch(input, { run, now, randomUUIDImpl, approvals })
+    applyPatch: (input) => applyPatch(input, { run, now, randomUUIDImpl, approvals }),
+    runChecks: (input) => runChecks(input, { run, now, randomUUIDImpl, approvals })
   };
 }

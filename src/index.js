@@ -34,6 +34,18 @@ export function createServer(workflow) {
       confirm: z.string().optional()
     }
   }, async (input) => toToolResult(await workflow.applyPatch(input)));
+  server.registerTool("run_checks", {
+    description: "Preview and run only named package.json scripts with a guarded approval.",
+    inputSchema: {
+      projectPath: z.string().min(1),
+      snapshot: z.object({ repoRoot: z.string(), head: z.string(), branch: z.string(), statusHash: z.string() }),
+      scripts: z.array(z.string().min(1)).min(1),
+      mode: z.enum(["preview", "execute"]),
+      approvalToken: z.string().optional(),
+      confirm: z.string().optional(),
+      timeoutSeconds: z.number().positive().max(120).optional()
+    }
+  }, async (input) => toToolResult(await workflow.runChecks(input)));
   return server;
 }
 

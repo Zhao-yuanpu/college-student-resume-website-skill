@@ -387,14 +387,120 @@ async function pushChanges(input, { run, now, randomUUIDImpl, approvals }) {
   }
 }
 
+function githubRepository(remoteUrl) {
+  const match = remoteUrl.match(/^(?:https?:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
+  return match ? { owner: match[1], repository: match[2] } : null;
+}
+
+function pagesResult(verification, summary, evidence, nextAction) {
+  return { ok: verification === "full" || verification === "partial", phase: "pages", verification, summary, evidence, nextAction };
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function fetchWithTimeout(fetchImpl, publicUrl, timeoutMs) {
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("Public URL request timed out"));
+    }, timeoutMs);
+  });
+  try {
+    const response = await Promise.race([fetchImpl(publicUrl, { signal: controller.signal }), timeout]);
+    const body = await Promise.race([response.text(), timeout]);
+    return { response, body };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeoutSeconds = 60 }, { run, fetchImpl }) {
+  const evidence = [];
+  let deadline = 0;
+  try {
+    if (typeof timeoutSeconds !== "number" || timeoutSeconds <= 0 || timeoutSeconds > 60) throw new Error("timeoutSeconds must be greater than 0 and no more than 60");
+    if (expectedText !== undefined && (typeof expectedText !== "string" || !expectedText)) throw new Error("expectedText must be a nonblank string when provided");
+    let parsedUrl;
+    if (publicUrl !== undefined) {
+      if (typeof publicUrl !== "string") throw new Error("publicUrl must be a string when provided");
+      parsedUrl = new URL(publicUrl);
+      if (!/^https?:$/.test(parsedUrl.protocol) || parsedUrl.username || parsedUrl.password) throw new Error("publicUrl must be a public HTTP(S) URL");
+    } else if (expectedText !== undefined) {
+      throw new Error("expectedText requires publicUrl");
+    }
+    deadline = Date.now() + timeoutSeconds * 1000;
+    const current = await snapshot(run, projectPath);
+    const configuredRemote = await run("git", ["-C", current.repoRoot, "config", "--get", `branch.${current.branch}.remote`], { cwd: current.repoRoot, timeoutMs: Math.max(1, deadline - Date.now()) });
+    const remote = configuredRemote.code === 0 && configuredRemote.stdout.trim() ? configuredRemote.stdout.trim() : "origin";
+    const remoteUrl = (await git(run, current.repoRoot, ["remote", "get-url", remote])).stdout.trim();
+    const remoteHeadResult = await run("git", ["-C", current.repoRoot, "ls-remote", "--heads", "--", remoteUrl, `refs/heads/${current.branch}`], { cwd: current.repoRoot, timeoutMs: Math.max(1, deadline - Date.now()) });
+    if (remoteHeadResult.code !== 0) throw new Error(remoteHeadResult.stderr.trim() || "Could not read the tracked remote branch");
+    const remoteHead = remoteHeadResult.stdout.trim().split(/\s+/)[0];
+    evidence.push({ remote, branch: current.branch, localHead: current.head, remoteHead: remoteHead || null, synchronized: remoteHead === current.head });
+    if (remoteHead !== current.head) return pagesResult("failed", "Tracked remote branch does not match local HEAD", evidence, "Push the current branch, then verify again");
+
+    const repository = githubRepository(remoteUrl);
+    let buildUnavailable = !repository;
+    if (repository) {
+      while (true) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return pagesResult("timeout", "Timed out waiting for GitHub Pages build status", evidence, "Try verification again after the Pages build completes");
+        let build;
+        try {
+          build = await run("gh", ["api", `repos/${repository.owner}/${repository.repository}/pages/builds/latest`, "--jq", ".status"], { cwd: current.repoRoot, timeoutMs: remaining });
+        } catch (error) {
+          evidence.push({ buildState: "unavailable", reason: error.message });
+          buildUnavailable = true;
+          break;
+        }
+        if (build.code !== 0) {
+          evidence.push({ buildState: "unavailable", reason: (build.stderr || build.stdout || "gh could not read Pages status").trim() });
+          buildUnavailable = true;
+          break;
+        }
+        const status = build.stdout.trim().toLowerCase();
+        evidence.push({ buildState: status });
+        if (status === "built") break;
+        if (["errored", "error", "failed", "canceled", "cancelled"].includes(status)) return pagesResult("failed", `GitHub Pages build is ${status}`, evidence, "Fix the Pages build, then verify again");
+        const remainingAfterPoll = deadline - Date.now();
+        if (remainingAfterPoll <= 0) return pagesResult("timeout", "Timed out waiting for GitHub Pages build status", evidence, "Try verification again after the Pages build completes");
+        await wait(Math.min(250, remainingAfterPoll));
+      }
+    } else {
+      evidence.push({ buildState: "unavailable", reason: "Configured remote is not a recognizable GitHub URL" });
+    }
+
+    if (!parsedUrl) return pagesResult("partial", "Remote branch is synchronized, but no public URL was provided", evidence, "Provide the GitHub Pages public URL for live verification");
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return pagesResult("timeout", "Timed out before fetching the public URL", evidence, "Try verification again with a longer timeout");
+    let fetched;
+    try {
+      fetched = await fetchWithTimeout(fetchImpl, parsedUrl.href, remaining);
+    } catch (error) {
+      return pagesResult(error.message.includes("timed out") ? "timeout" : "failed", `Could not fetch public URL: ${error.message}`, evidence, "Check the public URL and try again");
+    }
+    evidence.push({ publicUrl: parsedUrl.href, status: fetched.response.status, ok: fetched.response.ok });
+    if (!fetched.response.ok) return pagesResult("failed", `Public URL returned HTTP ${fetched.response.status}`, evidence, "Fix the deployed site, then verify again");
+    if (expectedText !== undefined && !fetched.body.includes(expectedText)) return pagesResult("failed", "Public URL did not contain the expected text", evidence, "Check the deployed content, then verify again");
+    return pagesResult(buildUnavailable ? "partial" : "full", buildUnavailable ? "Public URL is live, but GitHub Pages build status is unavailable" : "GitHub Pages deployment is verified", evidence, buildUnavailable ? "Restore GitHub CLI Pages access for a full build-state check" : "Delivery is verified");
+  } catch (error) {
+    if (deadline && Date.now() >= deadline) return pagesResult("timeout", "Timed out while verifying GitHub Pages", evidence, "Try verification again with a longer timeout");
+    return pagesResult("failed", `Could not verify GitHub Pages: ${error.message}`, evidence, "Provide a local repository with a configured tracked remote");
+  }
+}
+
 export function createWorkflow({ run = runCommand, fetchImpl = globalThis.fetch, now = Date.now, randomUUIDImpl = randomUUID } = {}) {
-  void fetchImpl;
   const approvals = new Map();
   return {
     inspectProject: (input) => inspectProject(input, { run }),
     applyPatch: (input) => applyPatch(input, { run, now, randomUUIDImpl, approvals }),
     runChecks: (input) => runChecks(input, { run, now, randomUUIDImpl, approvals }),
     commitChanges: (input) => commitChanges(input, { run, now, randomUUIDImpl, approvals }),
-    pushChanges: (input) => pushChanges(input, { run, now, randomUUIDImpl, approvals })
+    pushChanges: (input) => pushChanges(input, { run, now, randomUUIDImpl, approvals }),
+    verifyGithubPages: (input) => verifyGithubPages(input, { run, fetchImpl })
   };
 }

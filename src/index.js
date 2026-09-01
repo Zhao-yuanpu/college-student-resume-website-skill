@@ -70,6 +70,15 @@ export function createServer(workflow) {
       confirm: z.string().optional()
     }).strict()
   }, async (input) => toToolResult(await workflow.pushChanges(input)));
+  server.registerTool("verify_github_pages", {
+    description: "Read-only verification of the tracked GitHub branch, Pages build state, and optional public site URL.",
+    inputSchema: z.object({
+      projectPath: z.string().min(1),
+      publicUrl: z.string().url().optional(),
+      expectedText: z.string().min(1).optional(),
+      timeoutSeconds: z.number().positive().max(60).optional()
+    }).strict()
+  }, async (input) => toToolResult(await workflow.verifyGithubPages(input)));
   return server;
 }
 

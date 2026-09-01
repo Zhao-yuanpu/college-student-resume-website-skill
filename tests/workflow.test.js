@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { createWorkflow } from "../src/workflow.js";
+import { createWorkflow, runCommand } from "../src/workflow.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -51,7 +51,7 @@ test("inspect_project rejects a repository without a commit", async (t) => {
   assert.equal(result.ok, false);
 });
 
-test("MCP stdio lists inspect_project, apply_patch, run_checks, commit_changes, and push_changes", async () => {
+test("MCP stdio lists all six guarded workflow tools", async () => {
   const published = process.env.MCP_SMOKE_PACKAGE;
   const command = published ? (process.platform === "win32" ? "npm.cmd" : "npm") : process.execPath;
   const args = published
@@ -61,7 +61,7 @@ test("MCP stdio lists inspect_project, apply_patch, run_checks, commit_changes, 
   const transport = new StdioClientTransport({ command, args });
   await client.connect(transport);
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch", "run_checks", "commit_changes", "push_changes"]);
+  assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch", "run_checks", "commit_changes", "push_changes", "verify_github_pages"]);
   await client.close();
 });
 
@@ -430,4 +430,93 @@ test("push_changes binds and reports the configured push URL", async (t) => {
   const executed = await workflow.pushChanges({ projectPath: root, snapshot: fresh.snapshot, remote: "origin", branch: "main", mode: "execute", approvalToken: replacementPreview.approvalToken, confirm: "PUSH" });
   assert.equal(executed.ok, true, JSON.stringify(executed));
   assert.equal(executed.evidence[0].pushUrl, replacementPushRemote);
+});
+
+async function githubRemote(t, root) {
+  await execFileAsync("git", ["remote", "add", "origin", "git@github.com:student/example-portfolio.git"], { cwd: root });
+  return (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout.trim();
+}
+
+function pagesRun(head, statuses = ["built"]) {
+  let statusIndex = 0;
+  return async (command, args, options) => {
+    if (command === "git" && args.includes("ls-remote")) return { code: 0, stdout: `${head}\trefs/heads/main\n`, stderr: "" };
+    if (command === "gh") return { code: 0, stdout: `${statuses[Math.min(statusIndex++, statuses.length - 1)]}\n`, stderr: "" };
+    return runCommand(command, args, options);
+  };
+}
+
+function staticPagesRun(head, status = "built") {
+  return async (command, args) => {
+    if (command === "gh") return { code: 0, stdout: `${status}\n`, stderr: "" };
+    const operation = args[2];
+    if (operation === "rev-parse") return { code: 0, stdout: args[3] === "--show-toplevel" ? "C:/portfolio\n" : `${head}\n`, stderr: "" };
+    if (operation === "branch") return { code: 0, stdout: "main\n", stderr: "" };
+    if (operation === "status") return { code: 0, stdout: "", stderr: "" };
+    if (operation === "config") return { code: 0, stdout: "origin\n", stderr: "" };
+    if (operation === "remote") return { code: 0, stdout: "git@github.com:student/example-portfolio.git\n", stderr: "" };
+    if (operation === "ls-remote") return { code: 0, stdout: `${head}\trefs/heads/main\n`, stderr: "" };
+    throw new Error(`Unexpected command: ${command} ${args.join(" ")}`);
+  };
+}
+
+test("verify_github_pages fully verifies a synchronized GitHub Pages site and expected text", async (t) => {
+  const root = await fixtureRepo(t);
+  const head = await githubRemote(t, root);
+  const fetchImpl = async () => ({ ok: true, status: 200, text: async () => "Expected portfolio title" });
+  const result = await createWorkflow({ run: pagesRun(head), fetchImpl }).verifyGithubPages({
+    projectPath: root,
+    publicUrl: "https://example.invalid/portfolio/",
+    expectedText: "Expected portfolio title",
+    timeoutSeconds: 1
+  });
+  assert.equal(result.ok, true, result.summary);
+  assert.equal(result.verification, "full");
+});
+
+test("verify_github_pages reports partial when gh is unavailable but HTTP succeeds", async (t) => {
+  const root = await fixtureRepo(t);
+  const head = await githubRemote(t, root);
+  const unavailableGh = async (command, args, options) => {
+    if (command === "git" && args.includes("ls-remote")) return { code: 0, stdout: `${head}\trefs/heads/main\n`, stderr: "" };
+    if (command === "gh") throw new Error("gh unavailable");
+    return runCommand(command, args, options);
+  };
+  const result = await createWorkflow({ run: unavailableGh, fetchImpl: async () => ({ ok: true, status: 200, text: async () => "live" }) }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/" });
+  assert.equal(result.ok, true, result.summary);
+  assert.equal(result.verification, "partial");
+});
+
+test("verify_github_pages fails when the remote branch is not at local HEAD", async (t) => {
+  const root = await fixtureRepo(t);
+  await githubRemote(t, root);
+  const result = await createWorkflow({ run: pagesRun("0".repeat(40)), fetchImpl: async () => ({ ok: true, status: 200, text: async () => "live" }) }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/" });
+  assert.equal(result.ok, false);
+  assert.equal(result.verification, "failed");
+});
+
+test("verify_github_pages fails for unsuccessful HTTP or missing expected text", async (t) => {
+  const root = await fixtureRepo(t);
+  const head = await githubRemote(t, root);
+  const workflow = createWorkflow({ run: pagesRun(head), fetchImpl: async () => ({ ok: false, status: 503, text: async () => "offline" }) });
+  const unavailable = await workflow.verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/" });
+  assert.equal(unavailable.verification, "failed");
+  const missingText = await createWorkflow({ run: pagesRun(head), fetchImpl: async () => ({ ok: true, status: 200, text: async () => "other page" }) }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/", expectedText: "Expected title" });
+  assert.equal(missingText.verification, "failed");
+});
+
+test("verify_github_pages aborts a non-settling public URL fetch at the timeout", async () => {
+  const head = "1".repeat(40);
+  let aborted = false;
+  const fetchImpl = (_, { signal }) => new Promise(() => signal.addEventListener("abort", () => { aborted = true; }));
+  const result = await createWorkflow({ run: staticPagesRun(head), fetchImpl }).verifyGithubPages({ projectPath: "C:/portfolio", publicUrl: "https://example.invalid/", timeoutSeconds: 0.02 });
+  assert.equal(result.verification, "timeout");
+  assert.equal(aborted, true);
+});
+
+test("verify_github_pages times out while Pages remains building", async () => {
+  const head = "1".repeat(40);
+  const result = await createWorkflow({ run: staticPagesRun(head, "building"), fetchImpl: async () => ({ ok: true, status: 200, text: async () => "live" }) }).verifyGithubPages({ projectPath: "C:/portfolio", publicUrl: "https://example.invalid/", timeoutSeconds: 0.02 });
+  assert.equal(result.ok, false);
+  assert.equal(result.verification, "timeout");
 });

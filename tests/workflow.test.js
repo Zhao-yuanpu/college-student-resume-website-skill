@@ -200,3 +200,18 @@ test("apply_patch requires both copy paths in allowedPaths", async (t) => {
   assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: copyPatch, allowedPaths: ["copy target.md"], mode: "preview" })).ok, false);
   assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: copyPatch, allowedPaths: ["copy source.md", "copy target.md"], mode: "preview" })).ok, true);
 });
+
+test("apply_patch decodes quoted UTF-8 paths without accepting mojibake", async (t) => {
+  const root = await fixtureRepo(t);
+  const filename = "测试.md";
+  await writeFile(join(root, filename), "one\n");
+  await execFileAsync("git", ["add", filename], { cwd: root });
+  await execFileAsync("git", ["commit", "-m", "unicode fixture"], { cwd: root });
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  await writeFile(join(root, filename), "two\n");
+  const { stdout: unicodePatch } = await execFileAsync("git", ["diff"], { cwd: root });
+  await execFileAsync("git", ["reset", "--hard"], { cwd: root });
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: unicodePatch, allowedPaths: [filename], mode: "preview" })).ok, true);
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: unicodePatch, allowedPaths: ["æµ‹è¯•.md"], mode: "preview" })).ok, false);
+});

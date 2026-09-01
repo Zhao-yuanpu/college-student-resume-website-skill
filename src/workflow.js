@@ -127,10 +127,17 @@ function gitPathToken(input, start) {
       const escaped = { a: "\u0007", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v" }[escape];
       if (escaped !== undefined) path += escaped;
       else if (/[0-7]/.test(escape)) {
-        const octal = `${escape}${input[index + 1] ?? ""}${input[index + 2] ?? ""}`;
+        let octal = `${escape}${input[index + 1] ?? ""}${input[index + 2] ?? ""}`;
         if (!/^[0-7]{3}$/.test(octal)) break;
-        path += String.fromCharCode(Number.parseInt(octal, 8));
+        const bytes = [Number.parseInt(octal, 8)];
         index += 2;
+        while (input[index + 1] === "\\") {
+          octal = input.slice(index + 2, index + 5);
+          if (!/^[0-7]{3}$/.test(octal)) break;
+          bytes.push(Number.parseInt(octal, 8));
+          index += 4;
+        }
+        path += Buffer.from(bytes).toString("utf8");
       } else if (escape === "\\" || escape === '"') path += escape;
       else throw new Error("Patch contains an invalid quoted file path");
     }

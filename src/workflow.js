@@ -366,22 +366,22 @@ async function pushChanges(input, { run, now, randomUUIDImpl, approvals }) {
     if (typeof branch !== "string" || branch.startsWith("-") || branch.includes(":")) throw new Error("branch must be a normal branch name");
     if (current.branch !== branch) throw new Error("branch must match the current branch");
     await git(run, current.repoRoot, ["check-ref-format", "--branch", branch]);
-    const remoteUrl = (await git(run, current.repoRoot, ["remote", "get-url", remote])).stdout.trim();
-    if (!remoteUrl) throw new Error("remote has no configured URL");
+    const pushUrl = (await git(run, current.repoRoot, ["remote", "get-url", "--push", remote])).stdout.trim();
+    if (!pushUrl) throw new Error("remote has no configured push URL");
     const refspec = `HEAD:refs/heads/${branch}`;
-    const binding = pushBinding(current, remote, branch, remoteUrl);
+    const binding = pushBinding(current, remote, branch, pushUrl);
     if (mode === "preview") {
       const token = randomUUIDImpl();
       approvals.set(token, { operation: "push_changes", bindingHash: hashJson(binding), expiresAt: now() + 5 * 60 * 1000 });
-      return { ok: true, phase: "push", summary: `Push is ready for ${remote} ${refspec}`, evidence: [{ remote, refspec }], approvalToken: token, nextAction: "Execute with confirm: PUSH" };
+      return { ok: true, phase: "push", summary: `Push is ready for ${remote} ${refspec}`, evidence: [{ remote, pushUrl, refspec }], approvalToken: token, nextAction: "Execute with confirm: PUSH" };
     }
     if (mode !== "execute" || confirm !== "PUSH") throw new Error("Execution requires confirm: PUSH");
     if (!approval || approval.operation !== "push_changes" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
     await git(run, current.repoRoot, ["push", remote, refspec]);
-    const remoteHead = (await git(run, current.repoRoot, ["ls-remote", "--heads", remote, `refs/heads/${branch}`])).stdout.trim().split(/\s+/)[0];
+    const remoteHead = (await git(run, current.repoRoot, ["ls-remote", "--heads", "--", pushUrl, `refs/heads/${branch}`])).stdout.trim().split(/\s+/)[0];
     if (remoteHead !== current.head) throw new Error("Remote branch does not match local HEAD after push");
     const fresh = await snapshot(run, current.repoRoot);
-    return { ok: true, phase: "push", summary: `Pushed ${refspec} to ${remote}`, evidence: [{ remote, refspec, remoteHead }], snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
+    return { ok: true, phase: "push", summary: `Pushed ${refspec} to ${remote}`, evidence: [{ remote, pushUrl, refspec, remoteHead }], snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
   } catch (error) {
     return { ok: false, phase: "push", summary: `Could not push changes: ${error.message}`, evidence: [], nextAction: "Preview a configured remote and current branch from a fresh snapshot" };
   }

@@ -23,7 +23,10 @@ async function fixtureRepo(t) {
     test: "node --test",
     "test:fixture": "node -e \"require('node:fs').writeFileSync('checked.txt','ok')\"",
     "hang:fixture": "node -e \"setTimeout(() => {}, 5000)\"",
-    "redact:fixture": "node -e \"console.log('TOKEN=secret-value')\""
+    "redact:fixture": "node -e \"console.log('TOKEN=secret-value')\"",
+    "fail:fixture": "node -e \"process.exit(1)\"",
+    "marker:fixture": "node -e \"require('node:fs').writeFileSync('marker.txt','ran')\"",
+    "spawn:fixture": "node -e \"const {spawn}=require('node:child_process');spawn(process.execPath,['-e', \\\"setTimeout(() => require('node:fs').writeFileSync('after-timeout.txt', 'ran'), 500)\\\"],{stdio:'ignore'});setTimeout(() => {}, 5000)\""
   } }));
   await execFileAsync("git", ["add", "README.md", "direction-approved.md", "package.json"], { cwd: root });
   await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: root });
@@ -35,7 +38,7 @@ test("inspect_project reports repository and evidence without personal text", as
   const result = await createWorkflow().inspectProject({ projectPath: root });
   assert.equal(result.ok, true);
   assert.equal(result.snapshot.repoRoot, root.replaceAll("\\", "/"));
-  assert.deepEqual(result.packageScripts, ["hang:fixture", "redact:fixture", "test", "test:fixture"]);
+  assert.deepEqual(result.packageScripts, ["fail:fixture", "hang:fixture", "marker:fixture", "redact:fixture", "spawn:fixture", "test", "test:fixture"]);
   assert.ok(result.evidence.some((item) => item.path === "direction-approved.md"));
   assert.equal(JSON.stringify(result).includes("证书编号"), false);
 });
@@ -252,4 +255,30 @@ test("run_checks rejects duplicates, times out, stops on failure, and redacts ou
   const timeout = await workflow.runChecks({ projectPath: root, snapshot: fresh.snapshot, scripts: ["hang:fixture"], mode: "preview" });
   const timedOut = await workflow.runChecks({ projectPath: root, snapshot: fresh.snapshot, scripts: ["hang:fixture"], mode: "execute", approvalToken: timeout.approvalToken, confirm: "RUN", timeoutSeconds: 0.05 });
   assert.equal(timedOut.ok, false);
+});
+
+test("run_checks binds the capped timeout and stops after the first failed script", async (t) => {
+  const root = await fixtureRepo(t);
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "preview", timeoutSeconds: 1 });
+  assert.equal((await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "execute", approvalToken: preview.approvalToken, confirm: "RUN", timeoutSeconds: 2 })).ok, false);
+  const failed = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["fail:fixture", "marker:fixture"], mode: "preview" });
+  const result = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["fail:fixture", "marker:fixture"], mode: "execute", approvalToken: failed.approvalToken, confirm: "RUN" });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.evidence.map((item) => item.script), ["fail:fixture"]);
+  await assert.rejects(readFile(join(root, "marker.txt"), "utf8"));
+});
+
+test("run_checks timeout returns promptly and kills spawned work", async (t) => {
+  const root = await fixtureRepo(t);
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["spawn:fixture"], mode: "preview", timeoutSeconds: 0.05 });
+  const started = Date.now();
+  const result = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["spawn:fixture"], mode: "execute", approvalToken: preview.approvalToken, confirm: "RUN", timeoutSeconds: 0.05 });
+  assert.equal(result.ok, false);
+  assert.ok(Date.now() - started < 3_000);
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  await assert.rejects(readFile(join(root, "after-timeout.txt"), "utf8"));
 });

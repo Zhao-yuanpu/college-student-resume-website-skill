@@ -12,11 +12,19 @@ export function runCommand(command, args, { cwd, input, timeoutMs = 30_000, maxO
     const isWindowsCommandScript = process.platform === "win32" && command.endsWith(".cmd");
     const child = isWindowsCommandScript
       ? spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/c", command, ...args], { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] })
-      : spawn(command, args, { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] });
+      : spawn(command, args, { cwd, detached: process.platform !== "win32", shell: false, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let outputBytes = 0;
     let timedOut = false;
+    let settled = false;
+    let timer;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
     const append = (target, chunk) => {
       const text = chunk.toString();
       const remaining = maxOutputBytes - outputBytes;
@@ -25,25 +33,27 @@ export function runCommand(command, args, { cwd, input, timeoutMs = 30_000, maxO
       outputBytes += Buffer.byteLength(clipped);
       return target + clipped;
     };
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       timedOut = true;
       if (process.platform === "win32") spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { shell: false, stdio: "ignore" });
+      else {
+        try { process.kill(-child.pid, "SIGTERM"); } catch {}
+      }
       child.kill();
+      finish(reject, new Error(`${command} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk); });
     child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk); });
     child.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+      finish(reject, error);
     });
     child.once("close", (code, signal) => {
-      clearTimeout(timer);
       if (timedOut) {
-        reject(new Error(`${command} timed out after ${timeoutMs}ms`));
+        finish(reject, new Error(`${command} timed out after ${timeoutMs}ms`));
         return;
       }
-      resolve({ code, signal, stdout, stderr });
+      finish(resolve, { code, signal, stdout, stderr });
     });
     if (input !== undefined) child.stdin.end(input);
     else child.stdin.end();
@@ -221,8 +231,8 @@ function approvalBinding(current, patch, allowedPaths) {
   return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, patchHash: createHash("sha256").update(patch).digest("hex"), allowedPaths: [...allowedPaths].sort() };
 }
 
-function runChecksBinding(current, scripts) {
-  return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, scripts };
+function runChecksBinding(current, scripts, timeoutSeconds) {
+  return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, scripts, timeoutSeconds };
 }
 
 async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, allowedPaths, mode, approvalToken, confirm }, { run, now, randomUUIDImpl, approvals }) {
@@ -265,7 +275,9 @@ async function runChecks({ projectPath, snapshot: requestedSnapshot, scripts, mo
     const packageJson = JSON.parse(await readFile(join(current.repoRoot, "package.json"), "utf8"));
     const available = packageJson.scripts ?? {};
     if (scripts.some((script) => !Object.hasOwn(available, script))) throw new Error("Requested script is not defined in package.json");
-    const binding = runChecksBinding(current, scripts);
+    if (typeof timeoutSeconds !== "number" || timeoutSeconds <= 0) throw new Error("timeoutSeconds must be positive");
+    const cappedTimeoutSeconds = Math.min(timeoutSeconds, 120);
+    const binding = runChecksBinding(current, scripts, cappedTimeoutSeconds);
     if (mode === "preview") {
       const token = randomUUIDImpl();
       approvals.set(token, { operation: "run_checks", bindingHash: hashJson(binding), expiresAt: now() + 5 * 60 * 1000 });
@@ -273,8 +285,7 @@ async function runChecks({ projectPath, snapshot: requestedSnapshot, scripts, mo
     }
     if (mode !== "execute" || confirm !== "RUN") throw new Error("Execution requires confirm: RUN");
     if (!approval || approval.operation !== "run_checks" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
-    if (typeof timeoutSeconds !== "number" || timeoutSeconds <= 0) throw new Error("timeoutSeconds must be positive");
-    const timeoutMs = Math.min(timeoutSeconds * 1000, 120_000);
+    const timeoutMs = cappedTimeoutSeconds * 1000;
     const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
     for (const script of scripts) {
       try {

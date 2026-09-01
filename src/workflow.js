@@ -235,6 +235,10 @@ function runChecksBinding(current, scripts, timeoutSeconds) {
   return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, scripts, timeoutSeconds };
 }
 
+function commitBinding(current, paths, message) {
+  return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, paths, message };
+}
+
 async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, allowedPaths, mode, approvalToken, confirm }, { run, now, randomUUIDImpl, approvals }) {
   const approval = mode === "execute" ? approvals.get(approvalToken) : null;
   if (mode === "execute") approvals.delete(approvalToken);
@@ -304,12 +308,48 @@ async function runChecks({ projectPath, snapshot: requestedSnapshot, scripts, mo
   }
 }
 
+async function commitChanges({ projectPath, snapshot: requestedSnapshot, paths, message, mode, approvalToken, confirm }, { run, now, randomUUIDImpl, approvals }) {
+  const approval = mode === "execute" ? approvals.get(approvalToken) : null;
+  if (mode === "execute") approvals.delete(approvalToken);
+  try {
+    const current = await snapshot(run, projectPath);
+    if (!equalSnapshot(requestedSnapshot, current)) throw new Error("Snapshot is stale");
+    if (!Array.isArray(paths) || paths.length === 0) throw new Error("paths must be a non-empty list");
+    const allowed = paths.map(safePath).sort();
+    if (new Set(allowed).size !== allowed.length) throw new Error("paths must not contain duplicates");
+    for (const path of allowed) await assertInsideRoot(current.repoRoot, path);
+    if (typeof message !== "string" || !message.trim() || /[\r\n]/.test(message)) throw new Error("message must be a nonblank single line");
+    const stagedBefore = (await git(run, current.repoRoot, ["diff", "--cached", "--name-only", "-z"])).stdout.split("\0").filter(Boolean).map(safePath);
+    if (stagedBefore.some((path) => !allowed.includes(path))) throw new Error("Pre-existing staged paths are outside the commit scope");
+    const changed = (await git(run, current.repoRoot, ["diff", "--name-only", "HEAD", "--", ...allowed])).stdout.split("\n").filter(Boolean);
+    if (!changed.length) throw new Error("No changes to commit");
+    const binding = commitBinding(current, allowed, message);
+    if (mode === "preview") {
+      const token = randomUUIDImpl();
+      approvals.set(token, { operation: "commit_changes", bindingHash: hashJson(binding), expiresAt: now() + 5 * 60 * 1000 });
+      return { ok: true, phase: "commit", summary: `Commit is ready for ${allowed.join(", ")}`, evidence: allowed, approvalToken: token, nextAction: "Execute with confirm: COMMIT" };
+    }
+    if (mode !== "execute" || confirm !== "COMMIT") throw new Error("Execution requires confirm: COMMIT");
+    if (!approval || approval.operation !== "commit_changes" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
+    await git(run, current.repoRoot, ["add", "--", ...allowed]);
+    await git(run, current.repoRoot, ["diff", "--cached", "--check"]);
+    const staged = (await git(run, current.repoRoot, ["diff", "--cached", "--name-only", "-z"])).stdout;
+    if (!staged) throw new Error("No staged changes to commit");
+    await git(run, current.repoRoot, ["commit", "-m", message]);
+    const fresh = await snapshot(run, current.repoRoot);
+    return { ok: true, phase: "commit", summary: `Committed ${allowed.join(", ")}`, evidence: allowed, head: fresh.head, snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
+  } catch (error) {
+    return { ok: false, phase: "commit", summary: `Could not commit changes: ${error.message}`, evidence: [], nextAction: "Preview explicit changed paths from a fresh snapshot" };
+  }
+}
+
 export function createWorkflow({ run = runCommand, fetchImpl = globalThis.fetch, now = Date.now, randomUUIDImpl = randomUUID } = {}) {
   void fetchImpl;
   const approvals = new Map();
   return {
     inspectProject: (input) => inspectProject(input, { run }),
     applyPatch: (input) => applyPatch(input, { run, now, randomUUIDImpl, approvals }),
-    runChecks: (input) => runChecks(input, { run, now, randomUUIDImpl, approvals })
+    runChecks: (input) => runChecks(input, { run, now, randomUUIDImpl, approvals }),
+    commitChanges: (input) => commitChanges(input, { run, now, randomUUIDImpl, approvals })
   };
 }

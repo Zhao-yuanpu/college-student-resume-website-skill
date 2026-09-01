@@ -51,7 +51,7 @@ test("inspect_project rejects a repository without a commit", async (t) => {
   assert.equal(result.ok, false);
 });
 
-test("MCP stdio lists inspect_project, apply_patch, and run_checks", async () => {
+test("MCP stdio lists inspect_project, apply_patch, run_checks, and commit_changes", async () => {
   const published = process.env.MCP_SMOKE_PACKAGE;
   const command = published ? (process.platform === "win32" ? "npm.cmd" : "npm") : process.execPath;
   const args = published
@@ -61,7 +61,7 @@ test("MCP stdio lists inspect_project, apply_patch, and run_checks", async () =>
   const transport = new StdioClientTransport({ command, args });
   await client.connect(transport);
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch", "run_checks"]);
+  assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch", "run_checks", "commit_changes"]);
   await client.close();
 });
 
@@ -281,4 +281,66 @@ test("run_checks timeout returns promptly and kills spawned work", async (t) => 
   assert.ok(Date.now() - started < 3_000);
   await new Promise((resolve) => setTimeout(resolve, 700));
   await assert.rejects(readFile(join(root, "after-timeout.txt"), "utf8"));
+});
+
+test("commit_changes previews and commits only explicit paths", async (t) => {
+  const root = await fixtureRepo(t);
+  await writeFile(join(root, "README.md"), "Serve index.html locally.\n");
+  await writeFile(join(root, "notes-local.txt"), "keep local\n");
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const before = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout.trim();
+  const preview = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "preview" });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.deepEqual(preview.evidence, ["README.md"]);
+  assert.equal((await execFileAsync("git", ["diff", "--cached", "--name-only"], { cwd: root })).stdout, "");
+  const executed = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "execute", approvalToken: preview.approvalToken, confirm: "COMMIT" });
+  assert.equal(executed.ok, true, JSON.stringify(executed));
+  assert.notEqual(executed.head, before);
+  assert.equal((await execFileAsync("git", ["status", "--porcelain"], { cwd: root })).stdout, "?? notes-local.txt\n");
+  assert.equal((await execFileAsync("git", ["show", "--format=", "--name-only", "HEAD"], { cwd: root })).stdout, "README.md\n");
+  assert.equal((await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "execute", approvalToken: preview.approvalToken, confirm: "COMMIT" })).ok, false);
+});
+
+test("commit_changes rejects invalid scope and messages", async (t) => {
+  const root = await fixtureRepo(t);
+  await writeFile(join(root, "README.md"), "Serve index.html locally.\n");
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  for (const input of [
+    { paths: [], message: "docs: update readme" },
+    { paths: ["README.md"], message: " " },
+    { paths: ["README.md"], message: "docs: update\nreadme" },
+    { paths: ["../outside.txt"], message: "docs: update readme" }
+  ]) {
+    assert.equal((await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, ...input, mode: "preview" })).ok, false);
+  }
+});
+
+test("commit_changes binds approval to scope and requires exact COMMIT confirmation", async (t) => {
+  const root = await fixtureRepo(t);
+  await writeFile(join(root, "README.md"), "Serve index.html locally.\n");
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "preview" });
+  assert.equal((await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: another message", mode: "execute", approvalToken: preview.approvalToken, confirm: "COMMIT" })).ok, false);
+  const freshPreview = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "preview" });
+  assert.equal((await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "execute", approvalToken: freshPreview.approvalToken, confirm: "commit" })).ok, false);
+});
+
+test("commit_changes rejects empty or unsafe staged scope", async (t) => {
+  const root = await fixtureRepo(t);
+  const workflow = createWorkflow();
+  let inspected = await workflow.inspectProject({ projectPath: root });
+  assert.equal((await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "preview" })).ok, false);
+  await writeFile(join(root, "README.md"), "line with space \n");
+  await writeFile(join(root, "direction-approved.md"), "changed\n");
+  await execFileAsync("git", ["add", "direction-approved.md"], { cwd: root });
+  inspected = await workflow.inspectProject({ projectPath: root });
+  assert.equal((await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "preview" })).ok, false);
+  await execFileAsync("git", ["reset", "direction-approved.md"], { cwd: root });
+  inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "preview" });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.equal((await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "execute", approvalToken: preview.approvalToken, confirm: "COMMIT" })).ok, false);
 });

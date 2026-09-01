@@ -206,6 +206,10 @@ function safePath(path) {
   return normalizedPath;
 }
 
+function literalPathspecs(paths) {
+  return paths.map((path) => `:(literal)${path}`);
+}
+
 async function assertInsideRoot(repoRoot, path) {
   const root = await realpath(repoRoot);
   let candidate = resolve(root, path);
@@ -318,11 +322,13 @@ async function commitChanges({ projectPath, snapshot: requestedSnapshot, paths, 
     const allowed = paths.map(safePath).sort();
     if (new Set(allowed).size !== allowed.length) throw new Error("paths must not contain duplicates");
     for (const path of allowed) await assertInsideRoot(current.repoRoot, path);
+    const pathspecs = literalPathspecs(allowed);
     if (typeof message !== "string" || !message.trim() || /[\r\n]/.test(message)) throw new Error("message must be a nonblank single line");
     const stagedBefore = (await git(run, current.repoRoot, ["diff", "--cached", "--name-only", "-z"])).stdout.split("\0").filter(Boolean).map(safePath);
     if (stagedBefore.some((path) => !allowed.includes(path))) throw new Error("Pre-existing staged paths are outside the commit scope");
-    const changed = (await git(run, current.repoRoot, ["diff", "--name-only", "HEAD", "--", ...allowed])).stdout.split("\n").filter(Boolean);
-    if (!changed.length) throw new Error("No changes to commit");
+    const changed = new Set((await git(run, current.repoRoot, ["diff", "--name-only", "-z", "HEAD", "--", ...pathspecs])).stdout.split("\0").filter(Boolean));
+    for (const path of (await git(run, current.repoRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...pathspecs])).stdout.split("\0").filter(Boolean)) changed.add(path);
+    if (changed.size === 0) throw new Error("No changes to commit");
     const binding = commitBinding(current, allowed, message);
     if (mode === "preview") {
       const token = randomUUIDImpl();
@@ -331,9 +337,9 @@ async function commitChanges({ projectPath, snapshot: requestedSnapshot, paths, 
     }
     if (mode !== "execute" || confirm !== "COMMIT") throw new Error("Execution requires confirm: COMMIT");
     if (!approval || approval.operation !== "commit_changes" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
-    await git(run, current.repoRoot, ["add", "--", ...allowed]);
-    await git(run, current.repoRoot, ["diff", "--cached", "--check"]);
-    const staged = (await git(run, current.repoRoot, ["diff", "--cached", "--name-only", "-z"])).stdout;
+    await git(run, current.repoRoot, ["add", "--", ...pathspecs]);
+    await git(run, current.repoRoot, ["diff", "--cached", "--check", "--", ...pathspecs]);
+    const staged = (await git(run, current.repoRoot, ["diff", "--cached", "--name-only", "-z", "--", ...pathspecs])).stdout;
     if (!staged) throw new Error("No staged changes to commit");
     await git(run, current.repoRoot, ["commit", "-m", message]);
     const fresh = await snapshot(run, current.repoRoot);

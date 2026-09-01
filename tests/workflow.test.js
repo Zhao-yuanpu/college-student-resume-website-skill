@@ -344,3 +344,26 @@ test("commit_changes rejects empty or unsafe staged scope", async (t) => {
   assert.equal(preview.ok, true, JSON.stringify(preview));
   assert.equal((await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "execute", approvalToken: preview.approvalToken, confirm: "COMMIT" })).ok, false);
 });
+
+test("commit_changes treats pathspec-looking paths literally", async (t) => {
+  const root = await fixtureRepo(t);
+  await writeFile(join(root, "README.md"), "Serve index.html locally.\n");
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const result = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["*.md"], message: "docs: update readme", mode: "preview" });
+  assert.equal(result.ok, false);
+});
+
+test("commit_changes commits a selected untracked file without touching another", async (t) => {
+  const root = await fixtureRepo(t);
+  await writeFile(join(root, "new-profile.md"), "new profile\n");
+  await writeFile(join(root, "notes-local.txt"), "keep local\n");
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["new-profile.md"], message: "docs: add profile", mode: "preview" });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  const executed = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["new-profile.md"], message: "docs: add profile", mode: "execute", approvalToken: preview.approvalToken, confirm: "COMMIT" });
+  assert.equal(executed.ok, true, JSON.stringify(executed));
+  assert.equal((await execFileAsync("git", ["show", "--format=", "--name-only", "HEAD"], { cwd: root })).stdout, "new-profile.md\n");
+  assert.equal((await execFileAsync("git", ["status", "--porcelain"], { cwd: root })).stdout, "?? notes-local.txt\n");
+});

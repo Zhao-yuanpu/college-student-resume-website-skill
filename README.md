@@ -91,7 +91,7 @@ Add this row to the active Harness profile or overlay:
     toolCallTimeoutMs: 120000
 ```
 
-DeepSeek Harness exposes these as `mcp__student_portfolio__*`. See the [DeepSeek Harness official MCP client](https://github.com/deepseek-ai/deepseek-harness/blob/main/packages/mcp/mcp-client/README.md).
+DeepSeek Harness exposes these as `mcp__student_portfolio__*`. See the [DeepSeek Harness official MCP client](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/mcp/mcp-client/README.md).
 
 ## Optional skill
 

@@ -58,6 +58,18 @@ export function createServer(workflow) {
       confirm: z.string().optional()
     }
   }, async (input) => toToolResult(await workflow.commitChanges(input)));
+  server.registerTool("push_changes", {
+    description: "Preview and normally push the current branch to a configured remote with a guarded approval.",
+    inputSchema: z.object({
+      projectPath: z.string().min(1),
+      snapshot: z.object({ repoRoot: z.string(), head: z.string(), branch: z.string(), statusHash: z.string() }),
+      remote: z.string().min(1),
+      branch: z.string().min(1),
+      mode: z.enum(["preview", "execute"]),
+      approvalToken: z.string().optional(),
+      confirm: z.string().optional()
+    }).strict()
+  }, async (input) => toToolResult(await workflow.pushChanges(input)));
   return server;
 }
 

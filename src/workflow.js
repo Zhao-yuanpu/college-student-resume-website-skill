@@ -243,6 +243,10 @@ function commitBinding(current, paths, message) {
   return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, paths, message };
 }
 
+function pushBinding(current, remote, branch, remoteUrl) {
+  return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, remote, branch, remoteUrl };
+}
+
 async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, allowedPaths, mode, approvalToken, confirm }, { run, now, randomUUIDImpl, approvals }) {
   const approval = mode === "execute" ? approvals.get(approvalToken) : null;
   if (mode === "execute") approvals.delete(approvalToken);
@@ -349,6 +353,40 @@ async function commitChanges({ projectPath, snapshot: requestedSnapshot, paths, 
   }
 }
 
+async function pushChanges(input, { run, now, randomUUIDImpl, approvals }) {
+  const { projectPath, snapshot: requestedSnapshot, remote, branch, mode, approvalToken, confirm } = input;
+  const approval = mode === "execute" ? approvals.get(approvalToken) : null;
+  if (mode === "execute") approvals.delete(approvalToken);
+  try {
+    const allowedFields = new Set(["projectPath", "snapshot", "remote", "branch", "mode", "approvalToken", "confirm"]);
+    if (Object.keys(input).some((key) => !allowedFields.has(key))) throw new Error("push_changes does not accept remote URLs or Git arguments");
+    const current = await snapshot(run, projectPath);
+    if (!equalSnapshot(requestedSnapshot, current)) throw new Error("Snapshot is stale");
+    if (typeof remote !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(remote)) throw new Error("remote must be a configured remote name");
+    if (typeof branch !== "string" || branch.startsWith("-") || branch.includes(":")) throw new Error("branch must be a normal branch name");
+    if (current.branch !== branch) throw new Error("branch must match the current branch");
+    await git(run, current.repoRoot, ["check-ref-format", "--branch", branch]);
+    const remoteUrl = (await git(run, current.repoRoot, ["remote", "get-url", remote])).stdout.trim();
+    if (!remoteUrl) throw new Error("remote has no configured URL");
+    const refspec = `HEAD:refs/heads/${branch}`;
+    const binding = pushBinding(current, remote, branch, remoteUrl);
+    if (mode === "preview") {
+      const token = randomUUIDImpl();
+      approvals.set(token, { operation: "push_changes", bindingHash: hashJson(binding), expiresAt: now() + 5 * 60 * 1000 });
+      return { ok: true, phase: "push", summary: `Push is ready for ${remote} ${refspec}`, evidence: [{ remote, refspec }], approvalToken: token, nextAction: "Execute with confirm: PUSH" };
+    }
+    if (mode !== "execute" || confirm !== "PUSH") throw new Error("Execution requires confirm: PUSH");
+    if (!approval || approval.operation !== "push_changes" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
+    await git(run, current.repoRoot, ["push", remote, refspec]);
+    const remoteHead = (await git(run, current.repoRoot, ["ls-remote", "--heads", remote, `refs/heads/${branch}`])).stdout.trim().split(/\s+/)[0];
+    if (remoteHead !== current.head) throw new Error("Remote branch does not match local HEAD after push");
+    const fresh = await snapshot(run, current.repoRoot);
+    return { ok: true, phase: "push", summary: `Pushed ${refspec} to ${remote}`, evidence: [{ remote, refspec, remoteHead }], snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
+  } catch (error) {
+    return { ok: false, phase: "push", summary: `Could not push changes: ${error.message}`, evidence: [], nextAction: "Preview a configured remote and current branch from a fresh snapshot" };
+  }
+}
+
 export function createWorkflow({ run = runCommand, fetchImpl = globalThis.fetch, now = Date.now, randomUUIDImpl = randomUUID } = {}) {
   void fetchImpl;
   const approvals = new Map();
@@ -356,6 +394,7 @@ export function createWorkflow({ run = runCommand, fetchImpl = globalThis.fetch,
     inspectProject: (input) => inspectProject(input, { run }),
     applyPatch: (input) => applyPatch(input, { run, now, randomUUIDImpl, approvals }),
     runChecks: (input) => runChecks(input, { run, now, randomUUIDImpl, approvals }),
-    commitChanges: (input) => commitChanges(input, { run, now, randomUUIDImpl, approvals })
+    commitChanges: (input) => commitChanges(input, { run, now, randomUUIDImpl, approvals }),
+    pushChanges: (input) => pushChanges(input, { run, now, randomUUIDImpl, approvals })
   };
 }

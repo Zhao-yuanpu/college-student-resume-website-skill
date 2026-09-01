@@ -51,7 +51,7 @@ test("inspect_project rejects a repository without a commit", async (t) => {
   assert.equal(result.ok, false);
 });
 
-test("MCP stdio lists inspect_project, apply_patch, run_checks, and commit_changes", async () => {
+test("MCP stdio lists inspect_project, apply_patch, run_checks, commit_changes, and push_changes", async () => {
   const published = process.env.MCP_SMOKE_PACKAGE;
   const command = published ? (process.platform === "win32" ? "npm.cmd" : "npm") : process.execPath;
   const args = published
@@ -61,7 +61,7 @@ test("MCP stdio lists inspect_project, apply_patch, run_checks, and commit_chang
   const transport = new StdioClientTransport({ command, args });
   await client.connect(transport);
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch", "run_checks", "commit_changes"]);
+  assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch", "run_checks", "commit_changes", "push_changes"]);
   await client.close();
 });
 
@@ -366,4 +366,45 @@ test("commit_changes commits a selected untracked file without touching another"
   assert.equal(executed.ok, true, JSON.stringify(executed));
   assert.equal((await execFileAsync("git", ["show", "--format=", "--name-only", "HEAD"], { cwd: root })).stdout, "new-profile.md\n");
   assert.equal((await execFileAsync("git", ["status", "--porcelain"], { cwd: root })).stdout, "?? notes-local.txt\n");
+});
+
+async function bareRemote(t, root) {
+  const remote = await mkdtemp(join(tmpdir(), "portfolio-mcp-remote-"));
+  t.after(() => rm(remote, { recursive: true, force: true }));
+  await execFileAsync("git", ["init", "--bare", remote]);
+  await execFileAsync("git", ["remote", "add", "origin", remote], { cwd: root });
+  return remote;
+}
+
+test("push_changes previews then pushes HEAD to the configured bare remote once", async (t) => {
+  const root = await fixtureRepo(t);
+  const remoteRoot = await bareRemote(t, root);
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "preview" });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.deepEqual(preview.evidence, [{ remote: "origin", refspec: "HEAD:refs/heads/main" }]);
+  const executed = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "execute", approvalToken: preview.approvalToken, confirm: "PUSH" });
+  assert.equal(executed.ok, true, JSON.stringify(executed));
+  assert.equal(executed.evidence[0].refspec, "HEAD:refs/heads/main");
+  assert.equal(executed.evidence[0].remoteHead, (await execFileAsync("git", ["--git-dir", remoteRoot, "rev-parse", "refs/heads/main"])).stdout.trim());
+  assert.equal((await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "execute", approvalToken: preview.approvalToken, confirm: "PUSH" })).ok, false);
+});
+
+test("push_changes rejects unsafe remote, branch, confirmation, and URL input", async (t) => {
+  const root = await fixtureRepo(t);
+  await bareRemote(t, root);
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  for (const input of [
+    { remote: "missing", branch: "main" },
+    { remote: "origin", branch: "other" },
+    { remote: "origin", branch: "-main" },
+    { remote: "origin", branch: "main:other" },
+    { remote: "origin", branch: "main", remoteUrl: "https://example.invalid/replaced.git" }
+  ]) {
+    assert.equal((await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, ...input, mode: "preview" })).ok, false, JSON.stringify(input));
+  }
+  const preview = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "preview" });
+  assert.equal((await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "execute", approvalToken: preview.approvalToken, confirm: "push" })).ok, false);
 });

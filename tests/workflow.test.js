@@ -446,15 +446,18 @@ function pagesRun(head, statuses = ["built"]) {
   };
 }
 
-function staticPagesRun(head, status = "built") {
+function staticPagesRun(head, status = "built", remoteUrl = "git@github.com:student/example-portfolio.git", ghCalls = []) {
   return async (command, args) => {
-    if (command === "gh") return { code: 0, stdout: `${status}\n`, stderr: "" };
+    if (command === "gh") {
+      ghCalls.push(args);
+      return { code: 0, stdout: `${status}\n`, stderr: "" };
+    }
     const operation = args[2];
     if (operation === "rev-parse") return { code: 0, stdout: args[3] === "--show-toplevel" ? "C:/portfolio\n" : `${head}\n`, stderr: "" };
     if (operation === "branch") return { code: 0, stdout: "main\n", stderr: "" };
     if (operation === "status") return { code: 0, stdout: "", stderr: "" };
     if (operation === "config") return { code: 0, stdout: "origin\n", stderr: "" };
-    if (operation === "remote") return { code: 0, stdout: "git@github.com:student/example-portfolio.git\n", stderr: "" };
+    if (operation === "remote") return { code: 0, stdout: `${remoteUrl}\n`, stderr: "" };
     if (operation === "ls-remote") return { code: 0, stdout: `${head}\trefs/heads/main\n`, stderr: "" };
     throw new Error(`Unexpected command: ${command} ${args.join(" ")}`);
   };
@@ -512,6 +515,37 @@ test("verify_github_pages aborts a non-settling public URL fetch at the timeout"
   const result = await createWorkflow({ run: staticPagesRun(head), fetchImpl }).verifyGithubPages({ projectPath: "C:/portfolio", publicUrl: "https://example.invalid/", timeoutSeconds: 0.02 });
   assert.equal(result.verification, "timeout");
   assert.equal(aborted, true);
+});
+
+test("verify_github_pages uses the exact Pages API path for HTTPS and SSH remotes", async () => {
+  const head = "1".repeat(40);
+  for (const [remoteUrl, owner, repository] of [
+    ["https://github.com/https-owner/https-repo.git", "https-owner", "https-repo"],
+    ["ssh://git@github.com:22/ssh-owner/ssh-repo.git", "ssh-owner", "ssh-repo"]
+  ]) {
+    const ghCalls = [];
+    const result = await createWorkflow({ run: staticPagesRun(head, "built", remoteUrl, ghCalls) }).verifyGithubPages({ projectPath: "C:/portfolio" });
+    assert.equal(result.verification, "partial");
+    assert.deepEqual(ghCalls, [["api", `repos/${owner}/${repository}/pages/builds/latest`, "--jq", ".status"]]);
+  }
+});
+
+test("verify_github_pages gives every snapshot command the remaining total deadline", async () => {
+  const head = "1".repeat(40);
+  const timeouts = [];
+  const delayedRun = async (command, args, options = {}) => {
+    timeouts.push(options.timeoutMs ?? null);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const operation = args[2];
+    if (command === "git" && operation === "rev-parse") return { code: 0, stdout: args[3] === "--show-toplevel" ? "C:/portfolio\n" : `${head}\n`, stderr: "" };
+    if (command === "git" && operation === "branch") return { code: 0, stdout: "main\n", stderr: "" };
+    if (command === "git" && operation === "status") return { code: 0, stdout: "", stderr: "" };
+    throw new Error(`Unexpected command: ${command} ${args.join(" ")}`);
+  };
+  const result = await createWorkflow({ run: delayedRun }).verifyGithubPages({ projectPath: "C:/portfolio", timeoutSeconds: 0.02 });
+  assert.equal(result.verification, "timeout");
+  assert.ok(timeouts.length < 2, `snapshot kept running after the deadline: ${timeouts.length}`);
+  assert.ok(timeouts[0] > 0 && timeouts[0] <= 20, `missing remaining deadline: ${timeouts[0]}`);
 });
 
 test("verify_github_pages times out while Pages remains building", async () => {

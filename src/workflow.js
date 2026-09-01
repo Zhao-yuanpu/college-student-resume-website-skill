@@ -74,11 +74,11 @@ function normalized(path) {
   return path.replaceAll("\\", "/");
 }
 
-async function snapshot(run, start) {
-  const repoRoot = (await git(run, start, ["rev-parse", "--show-toplevel"])).stdout.trim();
-  const head = (await git(run, repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
-  const branch = (await git(run, repoRoot, ["branch", "--show-current"])).stdout.trim();
-  const status = (await git(run, repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout;
+async function snapshot(run, start, commandOptions = () => ({})) {
+  const repoRoot = (await git(run, start, ["rev-parse", "--show-toplevel"], commandOptions())).stdout.trim();
+  const head = (await git(run, repoRoot, ["rev-parse", "HEAD"], commandOptions())).stdout.trim();
+  const branch = (await git(run, repoRoot, ["branch", "--show-current"], commandOptions())).stdout.trim();
+  const status = (await git(run, repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], commandOptions())).stdout;
   return { repoRoot, head, branch, statusHash: createHash("sha256").update(status).digest("hex") };
 }
 
@@ -388,7 +388,7 @@ async function pushChanges(input, { run, now, randomUUIDImpl, approvals }) {
 }
 
 function githubRepository(remoteUrl) {
-  const match = remoteUrl.match(/^(?:https?:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
+  const match = remoteUrl.match(/^(?:https?:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com(?::\d+)?\/)([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
   return match ? { owner: match[1], repository: match[2] } : null;
 }
 
@@ -433,11 +433,16 @@ async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeout
       throw new Error("expectedText requires publicUrl");
     }
     deadline = Date.now() + timeoutSeconds * 1000;
-    const current = await snapshot(run, projectPath);
-    const configuredRemote = await run("git", ["-C", current.repoRoot, "config", "--get", `branch.${current.branch}.remote`], { cwd: current.repoRoot, timeoutMs: Math.max(1, deadline - Date.now()) });
+    const commandOptions = () => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("Verification timed out");
+      return { timeoutMs: remaining };
+    };
+    const current = await snapshot(run, projectPath, commandOptions);
+    const configuredRemote = await run("git", ["-C", current.repoRoot, "config", "--get", `branch.${current.branch}.remote`], { cwd: current.repoRoot, ...commandOptions() });
     const remote = configuredRemote.code === 0 && configuredRemote.stdout.trim() ? configuredRemote.stdout.trim() : "origin";
-    const remoteUrl = (await git(run, current.repoRoot, ["remote", "get-url", remote])).stdout.trim();
-    const remoteHeadResult = await run("git", ["-C", current.repoRoot, "ls-remote", "--heads", "--", remoteUrl, `refs/heads/${current.branch}`], { cwd: current.repoRoot, timeoutMs: Math.max(1, deadline - Date.now()) });
+    const remoteUrl = (await git(run, current.repoRoot, ["remote", "get-url", remote], commandOptions())).stdout.trim();
+    const remoteHeadResult = await run("git", ["-C", current.repoRoot, "ls-remote", "--heads", "--", remoteUrl, `refs/heads/${current.branch}`], { cwd: current.repoRoot, ...commandOptions() });
     if (remoteHeadResult.code !== 0) throw new Error(remoteHeadResult.stderr.trim() || "Could not read the tracked remote branch");
     const remoteHead = remoteHeadResult.stdout.trim().split(/\s+/)[0];
     evidence.push({ remote, branch: current.branch, localHead: current.head, remoteHead: remoteHead || null, synchronized: remoteHead === current.head });
@@ -447,11 +452,15 @@ async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeout
     let buildUnavailable = !repository;
     if (repository) {
       while (true) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) return pagesResult("timeout", "Timed out waiting for GitHub Pages build status", evidence, "Try verification again after the Pages build completes");
+        let options;
+        try {
+          options = commandOptions();
+        } catch {
+          return pagesResult("timeout", "Timed out waiting for GitHub Pages build status", evidence, "Try verification again after the Pages build completes");
+        }
         let build;
         try {
-          build = await run("gh", ["api", `repos/${repository.owner}/${repository.repository}/pages/builds/latest`, "--jq", ".status"], { cwd: current.repoRoot, timeoutMs: remaining });
+          build = await run("gh", ["api", `repos/${repository.owner}/${repository.repository}/pages/builds/latest`, "--jq", ".status"], { cwd: current.repoRoot, ...options });
         } catch (error) {
           evidence.push({ buildState: "unavailable", reason: error.message });
           buildUnavailable = true;

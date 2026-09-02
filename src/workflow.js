@@ -1,18 +1,71 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile, readdir, realpath } from "node:fs/promises";
-import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { constants } from "node:fs";
+import { access, lstat, open, readFile, readdir, readlink, realpath } from "node:fs/promises";
+import { lookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { BlockList, isIP } from "node:net";
+import { delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const ignoredDirectories = new Set([".git", "node_modules", "dist", "build"]);
 const binaryExtensions = new Set([".7z", ".avif", ".bmp", ".class", ".dll", ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".lock", ".mp3", ".mp4", ".pdf", ".png", ".rar", ".tar", ".ttf", ".wasm", ".webp", ".woff", ".woff2", ".zip"]);
 const maxTextFileSize = 256 * 1024;
+const maxPagesBodyBytes = 1024 * 1024;
+const protectedBasenames = new Set([".authinfo", ".git-credentials", ".htpasswd", ".netrc", ".npmrc", ".pypirc", ".yarnrc", ".yarnrc.yml", "_authinfo", "_netrc", "authorized_keys", "credentials", "credentials.json", "service-account.json", "service_account.json"]);
+const protectedPaths = new Set([".docker/config.json", ".kube/config"]);
+const blockedAddresses = new BlockList();
+
+for (const [network, prefix] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4]]) {
+  blockedAddresses.addSubnet(network, prefix, "ipv4");
+}
+for (const [network, prefix] of [["::", 96], ["::1", 128], ["64:ff9b::", 96], ["64:ff9b:1::", 48], ["100::", 64], ["2001::", 23], ["2002::", 16], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8]]) {
+  blockedAddresses.addSubnet(network, prefix, "ipv6");
+}
+blockedAddresses.addSubnet("2001:db8::", 32, "ipv6");
+blockedAddresses.addSubnet("3fff::", 20, "ipv6");
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function processGroupExists(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+
+async function terminateChild(child, closed) {
+  if (process.platform === "win32") {
+    await new Promise((resolve) => {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { shell: false, stdio: "ignore" });
+      killer.once("error", resolve);
+      killer.once("close", resolve);
+    });
+    try { child.kill(); } catch {}
+    await closed;
+    return;
+  }
+  try { process.kill(-child.pid, "SIGTERM"); } catch {}
+  const graceDeadline = Date.now() + 150;
+  while (processGroupExists(child.pid) && Date.now() < graceDeadline) await wait(20);
+  if (processGroupExists(child.pid)) {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  }
+  await closed;
+  while (processGroupExists(child.pid)) await wait(20);
+}
 
 export function runCommand(command, args, { cwd, input, timeoutMs = 30_000, maxOutputBytes = 1_048_576 } = {}) {
   return new Promise((resolve, reject) => {
-    const isWindowsCommandScript = process.platform === "win32" && command.endsWith(".cmd");
+    const isWindowsCommandScript = process.platform === "win32" && /\.cmd$/i.test(command);
     const child = isWindowsCommandScript
       ? spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/c", command, ...args], { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] })
       : spawn(command, args, { cwd, detached: process.platform !== "win32", shell: false, stdio: ["pipe", "pipe", "pipe"] });
+    const closed = new Promise((resolve) => child.once("close", resolve));
     let stdout = "";
     let stderr = "";
     let outputBytes = 0;
@@ -33,26 +86,23 @@ export function runCommand(command, args, { cwd, input, timeoutMs = 30_000, maxO
       outputBytes += Buffer.byteLength(clipped);
       return target + clipped;
     };
-    timer = setTimeout(() => {
+    timer = setTimeout(async () => {
       timedOut = true;
-      if (process.platform === "win32") spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { shell: false, stdio: "ignore" });
-      else {
-        try { process.kill(-child.pid, "SIGTERM"); } catch {}
+      try {
+        await terminateChild(child, closed);
+      } finally {
+        finish(reject, new Error(`${command} timed out after ${timeoutMs}ms`));
       }
-      child.kill();
-      finish(reject, new Error(`${command} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk); });
     child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk); });
     child.once("error", (error) => {
+      if (timedOut) return;
       finish(reject, error);
     });
     child.once("close", (code, signal) => {
-      if (timedOut) {
-        finish(reject, new Error(`${command} timed out after ${timeoutMs}ms`));
-        return;
-      }
+      if (timedOut) return;
       finish(resolve, { code, signal, stdout, stderr });
     });
     if (input !== undefined) child.stdin.end(input);
@@ -61,7 +111,11 @@ export function runCommand(command, args, { cwd, input, timeoutMs = 30_000, maxO
 }
 
 function redact(output) {
-  return output.replace(/\b(token|password|secret|key)\b\s*([=:])\s*("[^"]*"|'[^']*'|[^\s]+)/gi, "$1$2[REDACTED]");
+  return String(output)
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, "$1[REDACTED]@")
+    .replace(/\b((?:proxy-)?authorization)\s*:\s*(?:(?:bearer|basic)\s+)?[^\s,;]+/gi, "$1: [REDACTED]")
+    .replace(/(["']?[_-]*(?:(?:[a-z0-9]+[_-])*(?:api[_-]?key|auth[_-]?token|token|password|passwd|pwd|secret(?:[_-]access)?[_-]?key|secret|access[_-]?key|private[_-]?key|client[_-]?secret|session(?:[_-]?id)?|cookie|key)(?:[_-][a-z0-9]+)*)["']?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1[REDACTED]")
+    .replace(/\b(?:gh[pousr]_[a-z0-9]{20,}|github_pat_[a-z0-9_]{20,}|npm_[a-z0-9]{20,}|sk-[a-z0-9_-]{20,})\b/gi, "[REDACTED]");
 }
 
 async function git(run, repoRoot, args, options = {}) {
@@ -74,12 +128,73 @@ function normalized(path) {
   return path.replaceAll("\\", "/");
 }
 
+function isInside(root, candidate) {
+  const path = relative(root, candidate);
+  return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
+}
+
+function hashPart(hash, label, value) {
+  const data = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+  hash.update(`${label}\0${data.length}\0`);
+  hash.update(data);
+}
+
+async function hashFile(hash, path, checkDeadline) {
+  checkDeadline();
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) throw new Error("Snapshot path changed type while it was being read");
+    hashPart(hash, "file-size", before.size);
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let total = 0n;
+    while (true) {
+      checkDeadline();
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      total += BigInt(bytesRead);
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+    const after = await handle.stat({ bigint: true });
+    if (total !== before.size || after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs) throw new Error("File changed while the snapshot was being created");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function statusFingerprint(run, repoRoot, commandOptions) {
+  const status = (await git(run, repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], commandOptions())).stdout;
+  const index = (await git(run, repoRoot, ["ls-files", "--stage", "-z"], commandOptions())).stdout;
+  const listed = (await git(run, repoRoot, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], commandOptions())).stdout;
+  const hash = createHash("sha256");
+  hashPart(hash, "status", status);
+  hashPart(hash, "index", index);
+  for (const path of [...new Set(listed.split("\0").filter(Boolean))].sort()) {
+    commandOptions();
+    const absolutePath = resolve(repoRoot, path);
+    if (!isInside(repoRoot, absolutePath)) throw new Error("Git returned a path outside the repository");
+    hashPart(hash, "path", path);
+    let info;
+    try {
+      info = await lstat(absolutePath);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      hashPart(hash, "missing", "");
+      continue;
+    }
+    hashPart(hash, "mode", info.mode);
+    if (info.isSymbolicLink()) hashPart(hash, "symlink", await readlink(absolutePath));
+    else if (info.isFile()) await hashFile(hash, absolutePath, commandOptions);
+    else hashPart(hash, "type", info.isDirectory() ? "directory" : "other");
+  }
+  return hash.digest("hex");
+}
+
 async function snapshot(run, start, commandOptions = () => ({})) {
   const repoRoot = (await git(run, start, ["rev-parse", "--show-toplevel"], commandOptions())).stdout.trim();
   const head = (await git(run, repoRoot, ["rev-parse", "HEAD"], commandOptions())).stdout.trim();
   const branch = (await git(run, repoRoot, ["branch", "--show-current"], commandOptions())).stdout.trim();
-  const status = (await git(run, repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], commandOptions())).stdout;
-  return { repoRoot, head, branch, statusHash: createHash("sha256").update(status).digest("hex") };
+  return { repoRoot, head, branch, statusHash: await statusFingerprint(run, repoRoot, commandOptions) };
 }
 
 function categoriesFor(path, text) {
@@ -108,10 +223,64 @@ async function findEvidence(root, directory = root, evidence = []) {
   return evidence;
 }
 
+function sanitizedUrl(value, replacement = "[REDACTED]@") {
+  return redact(String(value).replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/i, `$1${replacement}`));
+}
+
+function summarizeWorktree(status) {
+  let staged = 0;
+  let unstaged = 0;
+  let untracked = 0;
+  const records = status.split("\0").filter(Boolean);
+  for (let index = 0; index < records.length; index += 1) {
+    const code = records[index].slice(0, 2);
+    if (code === "??") untracked += 1;
+    else {
+      if (code[0] !== " ") staged += 1;
+      if (code[1] !== " ") unstaged += 1;
+    }
+    if (/[RC]/.test(code)) index += 1;
+  }
+  const clean = staged === 0 && unstaged === 0 && untracked === 0;
+  return { clean, staged, unstaged, untracked, summary: clean ? "Worktree is clean" : `${staged} staged, ${unstaged} unstaged, ${untracked} untracked` };
+}
+
+async function configuredRemote(run, current) {
+  const tracking = await run("git", ["-C", current.repoRoot, "config", "--get", `branch.${current.branch}.remote`]);
+  let name = tracking.code === 0 ? tracking.stdout.trim() : "";
+  if (!name) {
+    const remotes = (await git(run, current.repoRoot, ["remote"])).stdout.split(/\r?\n/).filter(Boolean);
+    name = remotes.includes("origin") ? "origin" : remotes[0];
+  }
+  if (!name || name === ".") return null;
+  const url = (await git(run, current.repoRoot, ["remote", "get-url", name])).stdout.trim();
+  return { name, url: sanitizedUrl(url, "") };
+}
+
+function projectHints(entries, packageJson, readme) {
+  const directories = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+  const files = new Set(entries.filter((entry) => entry.isFile()).map((entry) => entry.name));
+  const sourceDirectories = ["src", "app", "pages", "public", "assets", "components"].filter((name) => directories.has(name));
+  const buildDirectories = ["dist", "build", "out", ".next"].filter((name) => directories.has(name));
+  const deploymentHints = [];
+  if (/github\s+pages/i.test(readme) || files.has("CNAME") || files.has(".nojekyll")) deploymentHints.push("GitHub Pages");
+  if (files.has("index.html")) deploymentHints.push("static entry: index.html");
+  for (const name of ["build", "deploy"]) if (Object.hasOwn(packageJson.scripts ?? {}, name)) deploymentHints.push(`package script: ${name}`);
+  const readmePromises = [];
+  if (/(?:open|serve|直接打开)[^\n]{0,80}index\.html|index\.html[^\n]{0,80}(?:direct|直接)/i.test(readme)) readmePromises.push("direct index.html use");
+  if (/github\s+pages/i.test(readme)) readmePromises.push("GitHub Pages delivery");
+  if (/npm\s+run\s+(?:test|build)|production build/i.test(readme)) readmePromises.push("package checks or build");
+  return { sourceDirectories, buildDirectories, deploymentHints, readmePromises };
+}
+
 async function inspectProject({ projectPath }, { run }) {
   try {
     const current = await snapshot(run, projectPath);
     const packageJson = JSON.parse(await readFile(join(current.repoRoot, "package.json"), "utf8").catch(() => "{}"));
+    const entries = await readdir(current.repoRoot, { withFileTypes: true });
+    const readmeEntry = entries.find((entry) => entry.isFile() && entry.name.toLowerCase() === "readme.md");
+    const readme = readmeEntry ? await readFile(join(current.repoRoot, readmeEntry.name), "utf8") : "";
+    const status = (await git(run, current.repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout;
     const evidence = await findEvidence(current.repoRoot);
     return {
       ok: true,
@@ -119,11 +288,14 @@ async function inspectProject({ projectPath }, { run }) {
       summary: `Inspected ${normalized(current.repoRoot)}`,
       snapshot: { ...current, repoRoot: normalized(current.repoRoot) },
       packageScripts: Object.keys(packageJson.scripts ?? {}).sort(),
+      remote: await configuredRemote(run, current),
+      worktreeStatus: summarizeWorktree(status),
+      ...projectHints(entries, packageJson, readme),
       evidence,
       nextAction: "Preview an allowed change before modifying the project"
     };
   } catch (error) {
-    return { ok: false, phase: "inspect", summary: `Could not inspect project: ${error.message}`, evidence: [], nextAction: "Provide a local Git repository path" };
+    return { ok: false, phase: "inspect", summary: `Could not inspect project: ${redact(error.message)}`, evidence: [], nextAction: "Provide a local Git repository path" };
   }
 }
 
@@ -200,7 +372,7 @@ function safePath(path) {
   }
   const lower = normalizedPath.toLowerCase();
   const name = lower.split("/").at(-1);
-  if (lower.split("/").includes(".git") || (name.startsWith(".env") && name !== ".env.example") || /\.(pem|key)$/.test(name) || /(credential|password|secret|token|id_rsa)/.test(name)) {
+  if (lower.split("/").includes(".git") || (name.startsWith(".env") && name !== ".env.example") || protectedBasenames.has(name) || protectedPaths.has(lower) || /\.(?:jks|kdbx|key|keystore|p12|pem|pfx)$/.test(name) || /^id_(?:rsa|dsa|ecdsa|ed25519|xmss)(?:\.pub)?$/.test(name) || /(credential|password|passwd|secret|token)/.test(name)) {
     throw new Error("Patch path is protected");
   }
   return normalizedPath;
@@ -216,7 +388,7 @@ async function assertInsideRoot(repoRoot, path) {
   while (true) {
     try {
       const resolved = await realpath(candidate);
-      if (resolved !== root && !resolved.startsWith(`${root}${sep}`)) throw new Error("Patch path escapes the repository");
+      if (!isInside(root, resolved)) throw new Error("Path escapes the repository");
       return;
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -235,8 +407,8 @@ function approvalBinding(current, patch, allowedPaths) {
   return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, patchHash: createHash("sha256").update(patch).digest("hex"), allowedPaths: [...allowedPaths].sort() };
 }
 
-function runChecksBinding(current, scripts, timeoutSeconds) {
-  return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, scripts, timeoutSeconds };
+function runChecksBinding(current, scripts, timeoutSeconds, npmCommand) {
+  return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, scripts, timeoutSeconds, npmCommand: normalized(npmCommand) };
 }
 
 function commitBinding(current, paths, message) {
@@ -245,6 +417,24 @@ function commitBinding(current, paths, message) {
 
 function pushBinding(current, remote, branch, remoteUrl) {
   return { repoRoot: normalized(current.repoRoot), head: current.head, branch: current.branch, statusHash: current.statusHash, remote, branch, remoteUrl };
+}
+
+async function trustedNpmCommand(repoRoot) {
+  const root = await realpath(repoRoot);
+  const name = process.platform === "win32" ? "npm.cmd" : "npm";
+  const directories = [dirname(process.execPath), ...(process.env.PATH ?? process.env.Path ?? "").split(delimiter)];
+  for (const rawDirectory of new Set(directories)) {
+    const directory = rawDirectory.replace(/^"|"$/g, "");
+    if (!directory) continue;
+    try {
+      const candidate = await realpath(join(directory, name));
+      await access(candidate, constants.X_OK);
+      if (!isInside(root, candidate)) return candidate;
+    } catch (error) {
+      if (!["ENOENT", "EACCES", "ENOTDIR"].includes(error.code)) throw error;
+    }
+  }
+  throw new Error(`Could not resolve a trusted ${name} outside the repository`);
 }
 
 async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, allowedPaths, mode, approvalToken, confirm }, { run, now, randomUUIDImpl, approvals }) {
@@ -272,7 +462,7 @@ async function applyPatch({ projectPath, snapshot: requestedSnapshot, patch, all
     const fresh = await snapshot(run, current.repoRoot);
     return { ok: true, phase: "patch", summary: `Applied patch to ${paths.join(", ")}`, evidence: paths, snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
   } catch (error) {
-    return { ok: false, phase: "patch", summary: `Could not apply patch: ${error.message}`, evidence: [], nextAction: "Preview a valid, allowed patch" };
+    return { ok: false, phase: "patch", summary: `Could not apply patch: ${redact(error.message)}`, evidence: [], nextAction: "Preview a valid, allowed patch" };
   }
 }
 
@@ -284,12 +474,16 @@ async function runChecks({ projectPath, snapshot: requestedSnapshot, scripts, mo
     const current = await snapshot(run, projectPath);
     if (!equalSnapshot(requestedSnapshot, current)) throw new Error("Snapshot is stale");
     if (!Array.isArray(scripts) || scripts.length === 0 || new Set(scripts).size !== scripts.length || scripts.some((script) => typeof script !== "string" || !script)) throw new Error("scripts must be a non-empty duplicate-free list");
-    const packageJson = JSON.parse(await readFile(join(current.repoRoot, "package.json"), "utf8"));
+    if (scripts.some((script) => !/^[A-Za-z0-9][A-Za-z0-9._:@/-]*$/.test(script))) throw new Error("scripts must use safe package script names without options or shell metacharacters");
+    const packagePath = await realpath(join(current.repoRoot, "package.json"));
+    if (!isInside(await realpath(current.repoRoot), packagePath)) throw new Error("package.json escapes the repository");
+    const packageJson = JSON.parse(await readFile(packagePath, "utf8"));
     const available = packageJson.scripts ?? {};
     if (scripts.some((script) => !Object.hasOwn(available, script))) throw new Error("Requested script is not defined in package.json");
     if (typeof timeoutSeconds !== "number" || timeoutSeconds <= 0) throw new Error("timeoutSeconds must be positive");
     const cappedTimeoutSeconds = Math.min(timeoutSeconds, 120);
-    const binding = runChecksBinding(current, scripts, cappedTimeoutSeconds);
+    const npmCommand = await trustedNpmCommand(current.repoRoot);
+    const binding = runChecksBinding(current, scripts, cappedTimeoutSeconds, npmCommand);
     if (mode === "preview") {
       const token = randomUUIDImpl();
       approvals.set(token, { operation: "run_checks", bindingHash: hashJson(binding), expiresAt: now() + 5 * 60 * 1000 });
@@ -298,7 +492,6 @@ async function runChecks({ projectPath, snapshot: requestedSnapshot, scripts, mo
     if (mode !== "execute" || confirm !== "RUN") throw new Error("Execution requires confirm: RUN");
     if (!approval || approval.operation !== "run_checks" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
     const timeoutMs = cappedTimeoutSeconds * 1000;
-    const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
     for (const script of scripts) {
       try {
         const result = await run(npmCommand, ["run", script], { cwd: current.repoRoot, timeoutMs, maxOutputBytes: 64 * 1024 });
@@ -312,7 +505,7 @@ async function runChecks({ projectPath, snapshot: requestedSnapshot, scripts, mo
     const fresh = await snapshot(run, current.repoRoot);
     return { ok: true, phase: "checks", summary: `Completed ${scripts.length} check${scripts.length === 1 ? "" : "s"}`, evidence, snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
   } catch (error) {
-    return { ok: false, phase: "checks", summary: `Could not run checks: ${error.message}`, evidence, nextAction: "Preview only package scripts from a fresh snapshot" };
+    return { ok: false, phase: "checks", summary: `Could not run checks: ${redact(error.message)}`, evidence, nextAction: "Preview only package scripts from a fresh snapshot" };
   }
 }
 
@@ -349,7 +542,7 @@ async function commitChanges({ projectPath, snapshot: requestedSnapshot, paths, 
     const fresh = await snapshot(run, current.repoRoot);
     return { ok: true, phase: "commit", summary: `Committed ${allowed.join(", ")}`, evidence: allowed, head: fresh.head, snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
   } catch (error) {
-    return { ok: false, phase: "commit", summary: `Could not commit changes: ${error.message}`, evidence: [], nextAction: "Preview explicit changed paths from a fresh snapshot" };
+    return { ok: false, phase: "commit", summary: `Could not commit changes: ${redact(error.message)}`, evidence: [], nextAction: "Preview explicit changed paths from a fresh snapshot" };
   }
 }
 
@@ -366,24 +559,26 @@ async function pushChanges(input, { run, now, randomUUIDImpl, approvals }) {
     if (typeof branch !== "string" || branch.startsWith("-") || branch.includes(":")) throw new Error("branch must be a normal branch name");
     if (current.branch !== branch) throw new Error("branch must match the current branch");
     await git(run, current.repoRoot, ["check-ref-format", "--branch", branch]);
-    const pushUrl = (await git(run, current.repoRoot, ["remote", "get-url", "--push", remote])).stdout.trim();
-    if (!pushUrl) throw new Error("remote has no configured push URL");
+    const pushUrls = (await git(run, current.repoRoot, ["remote", "get-url", "--push", "--all", remote])).stdout.split(/\r?\n/).filter(Boolean);
+    if (pushUrls.length !== 1) throw new Error("remote must have exactly one push URL");
+    const pushUrl = pushUrls[0];
+    const displayUrl = sanitizedUrl(pushUrl);
     const refspec = `HEAD:refs/heads/${branch}`;
     const binding = pushBinding(current, remote, branch, pushUrl);
     if (mode === "preview") {
       const token = randomUUIDImpl();
       approvals.set(token, { operation: "push_changes", bindingHash: hashJson(binding), expiresAt: now() + 5 * 60 * 1000 });
-      return { ok: true, phase: "push", summary: `Push is ready for ${remote} ${refspec}`, evidence: [{ remote, pushUrl, refspec }], approvalToken: token, nextAction: "Execute with confirm: PUSH" };
+      return { ok: true, phase: "push", summary: `Push is ready for ${remote} ${refspec}`, evidence: [{ remote, pushUrl: displayUrl, refspec }], approvalToken: token, nextAction: "Execute with confirm: PUSH" };
     }
     if (mode !== "execute" || confirm !== "PUSH") throw new Error("Execution requires confirm: PUSH");
     if (!approval || approval.operation !== "push_changes" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
-    await git(run, current.repoRoot, ["push", remote, refspec]);
+    await git(run, current.repoRoot, ["push", "--", pushUrl, refspec]);
     const remoteHead = (await git(run, current.repoRoot, ["ls-remote", "--heads", "--", pushUrl, `refs/heads/${branch}`])).stdout.trim().split(/\s+/)[0];
     if (remoteHead !== current.head) throw new Error("Remote branch does not match local HEAD after push");
     const fresh = await snapshot(run, current.repoRoot);
-    return { ok: true, phase: "push", summary: `Pushed ${refspec} to ${remote}`, evidence: [{ remote, pushUrl, refspec, remoteHead }], snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
+    return { ok: true, phase: "push", summary: `Pushed ${refspec} to ${remote}`, evidence: [{ remote, pushUrl: displayUrl, refspec, remoteHead }], snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
   } catch (error) {
-    return { ok: false, phase: "push", summary: `Could not push changes: ${error.message}`, evidence: [], nextAction: "Preview a configured remote and current branch from a fresh snapshot" };
+    return { ok: false, phase: "push", summary: `Could not push changes: ${redact(error.message)}`, evidence: [], nextAction: "Preview a configured remote and current branch from a fresh snapshot" };
   }
 }
 
@@ -396,29 +591,149 @@ function pagesResult(verification, summary, evidence, nextAction) {
   return { ok: verification === "full" || verification === "partial", phase: "pages", verification, summary, evidence, nextAction };
 }
 
-function wait(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function fetchWithTimeout(fetchImpl, publicUrl, timeoutMs) {
-  const controller = new AbortController();
+function withDeadline(promise, deadline, message, onTimeout = () => {}) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new Error(message));
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
-      controller.abort();
-      reject(new Error("Public URL request timed out"));
-    }, timeoutMs);
+      onTimeout();
+      reject(new Error(message));
+    }, remaining);
   });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
+}
+
+function parsePublicUrl(value) {
+  const parsed = new URL(value);
+  if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password) throw new Error("publicUrl must be a public HTTP(S) URL");
+  return parsed;
+}
+
+async function publicTarget(url, lookupImpl, deadline) {
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  const directFamily = isIP(hostname);
+  const resolved = directFamily
+    ? [{ address: hostname, family: directFamily }]
+    : await withDeadline(lookupImpl(hostname, { all: true, verbatim: true }), deadline, "Public URL DNS lookup timed out");
+  const addresses = Array.isArray(resolved) ? resolved : [resolved];
+  if (addresses.length === 0) throw new Error("Public URL hostname did not resolve");
+  const normalizedAddresses = addresses.map((record) => {
+    const address = typeof record === "string" ? record : record.address;
+    const family = isIP(address);
+    if (!family || blockedAddresses.check(address, `ipv${family}`)) throw new Error("Public URL must resolve only to public addresses");
+    return { address, family };
+  });
+  return { url, ...normalizedAddresses[0] };
+}
+
+function pinnedRequest(target, signal) {
+  return new Promise((resolve, reject) => {
+    const request = (target.url.protocol === "https:" ? httpsRequest : httpRequest)(target.url, {
+      method: "GET",
+      signal,
+      lookup: (_hostname, options, callback) => {
+        if (options?.all) callback(null, [{ address: target.address, family: target.family }]);
+        else callback(null, target.address, target.family);
+      }
+    }, (response) => resolve({
+      ok: response.statusCode >= 200 && response.statusCode < 300,
+      status: response.statusCode,
+      headers: { get: (name) => response.headers[name.toLowerCase()] ?? null },
+      body: response
+    }));
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+async function requestPublicUrl(fetchImpl, target, deadline) {
+  const controller = new AbortController();
+  const request = fetchImpl
+    ? fetchImpl(target.url.href, { signal: controller.signal, redirect: "manual" })
+    : pinnedRequest(target, controller.signal);
+  const response = await withDeadline(request, deadline, "Public URL request timed out", () => controller.abort());
+  return { response, controller };
+}
+
+function responseHeader(response, name) {
+  if (typeof response.headers?.get === "function") return response.headers.get(name);
+  return response.headers?.[name.toLowerCase()] ?? null;
+}
+
+async function discardBody(response) {
   try {
-    const response = await Promise.race([fetchImpl(publicUrl, { signal: controller.signal }), timeout]);
-    const body = await Promise.race([response.text(), timeout]);
-    return { response, body };
-  } finally {
-    clearTimeout(timer);
+    if (typeof response.body?.cancel === "function") await response.body.cancel();
+    else if (typeof response.body?.destroy === "function") response.body.destroy();
+  } catch {}
+}
+
+async function responseText(response, deadline, controller) {
+  const contentLength = responseHeader(response, "content-length");
+  if (/^\d+$/.test(contentLength ?? "") && Number(contentLength) > maxPagesBodyBytes) throw new Error("Public URL response body is too large");
+  const chunks = [];
+  let size = 0;
+  const append = (chunk) => {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > maxPagesBodyBytes) throw new Error("Public URL response body is too large");
+    chunks.push(buffer);
+  };
+  try {
+    if (typeof response.body?.getReader === "function") {
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await withDeadline(reader.read(), deadline, "Public URL request timed out", () => controller.abort());
+        if (done) break;
+        append(value);
+      }
+      return Buffer.concat(chunks).toString("utf8");
+    }
+    if (response.body?.[Symbol.asyncIterator]) {
+      const iterator = response.body[Symbol.asyncIterator]();
+      while (true) {
+        const { done, value } = await withDeadline(iterator.next(), deadline, "Public URL request timed out", () => controller.abort());
+        if (done) break;
+        append(value);
+      }
+      return Buffer.concat(chunks).toString("utf8");
+    }
+    const text = await withDeadline(response.text(), deadline, "Public URL request timed out", () => controller.abort());
+    append(text);
+    return Buffer.concat(chunks).toString("utf8");
+  } catch (error) {
+    controller.abort();
+    await discardBody(response);
+    throw error;
   }
 }
 
-async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeoutSeconds = 60 }, { run, fetchImpl }) {
+async function fetchPublicUrl(fetchImpl, lookupImpl, initialUrl, deadline) {
+  let url = initialUrl;
+  for (let redirects = 0; redirects <= 5; redirects += 1) {
+    const target = await publicTarget(url, lookupImpl, deadline);
+    const { response, controller } = await requestPublicUrl(fetchImpl, target, deadline);
+    const status = Number(response.status ?? response.statusCode);
+    if ([301, 302, 303, 307, 308].includes(status)) {
+      const location = responseHeader(response, "location");
+      await discardBody(response);
+      controller.abort();
+      if (!location) throw new Error(`Public URL returned HTTP ${status} without a Location header`);
+      if (redirects === 5) throw new Error("Public URL redirected too many times");
+      url = parsePublicUrl(new URL(location, url).href);
+      continue;
+    }
+    const ok = typeof response.ok === "boolean" ? response.ok : status >= 200 && status < 300;
+    if (!ok) {
+      await discardBody(response);
+      return { response: { status, ok }, body: "", url };
+    }
+    return { response: { status, ok }, body: await responseText(response, deadline, controller), url };
+  }
+  throw new Error("Public URL redirected too many times");
+}
+
+async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeoutSeconds = 60 }, { run, fetchImpl, lookupImpl }) {
   const evidence = [];
   let deadline = 0;
   try {
@@ -427,8 +742,7 @@ async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeout
     let parsedUrl;
     if (publicUrl !== undefined) {
       if (typeof publicUrl !== "string") throw new Error("publicUrl must be a string when provided");
-      parsedUrl = new URL(publicUrl);
-      if (!/^https?:$/.test(parsedUrl.protocol) || parsedUrl.username || parsedUrl.password) throw new Error("publicUrl must be a public HTTP(S) URL");
+      parsedUrl = parsePublicUrl(publicUrl);
     } else if (expectedText !== undefined) {
       throw new Error("expectedText requires publicUrl");
     }
@@ -462,12 +776,12 @@ async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeout
         try {
           build = await run("gh", ["api", `repos/${repository.owner}/${repository.repository}/pages/builds/latest`, "--jq", ".status"], { cwd: current.repoRoot, ...options });
         } catch (error) {
-          evidence.push({ buildState: "unavailable", reason: error.message });
+          evidence.push({ buildState: "unavailable", reason: redact(error.message) });
           buildUnavailable = true;
           break;
         }
         if (build.code !== 0) {
-          evidence.push({ buildState: "unavailable", reason: (build.stderr || build.stdout || "gh could not read Pages status").trim() });
+          evidence.push({ buildState: "unavailable", reason: redact((build.stderr || build.stdout || "gh could not read Pages status").trim()) });
           buildUnavailable = true;
           break;
         }
@@ -488,21 +802,21 @@ async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeout
     if (remaining <= 0) return pagesResult("timeout", "Timed out before fetching the public URL", evidence, "Try verification again with a longer timeout");
     let fetched;
     try {
-      fetched = await fetchWithTimeout(fetchImpl, parsedUrl.href, remaining);
+      fetched = await fetchPublicUrl(fetchImpl, lookupImpl, parsedUrl, deadline);
     } catch (error) {
-      return pagesResult(error.message.includes("timed out") ? "timeout" : "failed", `Could not fetch public URL: ${error.message}`, evidence, "Check the public URL and try again");
+      return pagesResult(error.message.includes("timed out") ? "timeout" : "failed", `Could not fetch public URL: ${redact(error.message)}`, evidence, "Check the public URL and try again");
     }
-    evidence.push({ publicUrl: parsedUrl.href, status: fetched.response.status, ok: fetched.response.ok });
+    evidence.push({ publicUrl: fetched.url.href, status: fetched.response.status, ok: fetched.response.ok });
     if (!fetched.response.ok) return pagesResult("failed", `Public URL returned HTTP ${fetched.response.status}`, evidence, "Fix the deployed site, then verify again");
     if (expectedText !== undefined && !fetched.body.includes(expectedText)) return pagesResult("failed", "Public URL did not contain the expected text", evidence, "Check the deployed content, then verify again");
     return pagesResult(buildUnavailable ? "partial" : "full", buildUnavailable ? "Public URL is live, but GitHub Pages build status is unavailable" : "GitHub Pages deployment is verified", evidence, buildUnavailable ? "Restore GitHub CLI Pages access for a full build-state check" : "Delivery is verified");
   } catch (error) {
     if (deadline && Date.now() >= deadline) return pagesResult("timeout", "Timed out while verifying GitHub Pages", evidence, "Try verification again with a longer timeout");
-    return pagesResult("failed", `Could not verify GitHub Pages: ${error.message}`, evidence, "Provide a local repository with a configured tracked remote");
+    return pagesResult("failed", `Could not verify GitHub Pages: ${redact(error.message)}`, evidence, "Provide a local repository with a configured tracked remote");
   }
 }
 
-export function createWorkflow({ run = runCommand, fetchImpl = globalThis.fetch, now = Date.now, randomUUIDImpl = randomUUID } = {}) {
+export function createWorkflow({ run = runCommand, fetchImpl, lookupImpl = lookup, now = Date.now, randomUUIDImpl = randomUUID } = {}) {
   const approvals = new Map();
   return {
     inspectProject: (input) => inspectProject(input, { run }),
@@ -510,6 +824,6 @@ export function createWorkflow({ run = runCommand, fetchImpl = globalThis.fetch,
     runChecks: (input) => runChecks(input, { run, now, randomUUIDImpl, approvals }),
     commitChanges: (input) => commitChanges(input, { run, now, randomUUIDImpl, approvals }),
     pushChanges: (input) => pushChanges(input, { run, now, randomUUIDImpl, approvals }),
-    verifyGithubPages: (input) => verifyGithubPages(input, { run, fetchImpl })
+    verifyGithubPages: (input) => verifyGithubPages(input, { run, fetchImpl, lookupImpl })
   };
 }

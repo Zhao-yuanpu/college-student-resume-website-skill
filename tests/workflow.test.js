@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { test } from "node:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -35,10 +35,14 @@ async function fixtureRepo(t) {
     test: "node --test",
     "test:fixture": "node -e \"require('node:fs').writeFileSync('checked.txt','ok')\"",
     "hang:fixture": "node -e \"setTimeout(() => {}, 5000)\"",
-    "redact:fixture": "node -e \"console.log('TOKEN=secret-value')\"",
+    "redact:fixture": "node -e \"console.log('TOKEN=secret-value');console.log('API_KEY=api-value');console.log('GITHUB_TOKEN:github-value');console.log('AWS_SECRET_ACCESS_KEY=aws-value');console.log('Authorization: Bearer bearer-value');console.log('_authToken=npm-value');console.log('SESSION_ID=session-value');console.log('COOKIE=session-cookie');console.log('REMOTE=https://user:pass@example.invalid/repo.git')\"",
     "fail:fixture": "node -e \"process.exit(1)\"",
     "marker:fixture": "node -e \"require('node:fs').writeFileSync('marker.txt','ran')\"",
-    "spawn:fixture": "node -e \"const {spawn}=require('node:child_process');spawn(process.execPath,['-e', \\\"setTimeout(() => require('node:fs').writeFileSync('after-timeout.txt', 'ran'), 500)\\\"],{stdio:'ignore'});setTimeout(() => {}, 5000)\""
+    "spawn:fixture": "node -e \"const {spawn}=require('node:child_process');spawn(process.execPath,['-e', \\\"setTimeout(() => require('node:fs').writeFileSync('after-timeout.txt', 'ran'), 500)\\\"],{stdio:'ignore'});setTimeout(() => {}, 5000)\"",
+    "-option": "node -e \"process.exit(0)\"",
+    "evil&whoami": "node -e \"process.exit(0)\"",
+    "evil%PATH%": "node -e \"process.exit(0)\"",
+    "evil name": "node -e \"process.exit(0)\""
   } }));
   await execFileAsync("git", ["add", "README.md", "direction-approved.md", "package.json"], { cwd: root });
   await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: root });
@@ -47,12 +51,33 @@ async function fixtureRepo(t) {
 
 test("inspect_project reports repository and evidence without personal text", async (t) => {
   const root = await fixtureRepo(t);
+  await mkdir(join(root, "src"));
+  await mkdir(join(root, "dist"));
+  await writeFile(join(root, "src", "main.js"), "console.log('portfolio');\n");
+  await writeFile(join(root, "dist", "index.html"), "<!doctype html>\n");
+  await writeFile(join(root, "index.html"), "<!doctype html>\n");
+  await writeFile(join(root, "README.md"), "Open index.html directly. Deploy with GitHub Pages.\n");
+  await execFileAsync("git", ["add", "README.md", "src/main.js", "dist/index.html", "index.html"], { cwd: root });
+  await execFileAsync("git", ["commit", "-m", "inspection fixture"], { cwd: root });
+  await execFileAsync("git", ["remote", "add", "origin", "https://student:github-token@github.com/student/example-portfolio.git"], { cwd: root });
+  await execFileAsync("git", ["config", "branch.main.remote", "origin"], { cwd: root });
   const result = await createWorkflow().inspectProject({ projectPath: root });
   assert.equal(result.ok, true);
   assert.equal(result.snapshot.repoRoot, root.replaceAll("\\", "/"));
-  assert.deepEqual(result.packageScripts, ["fail:fixture", "hang:fixture", "marker:fixture", "redact:fixture", "spawn:fixture", "test", "test:fixture"]);
+  assert.deepEqual(result.packageScripts, ["-option", "evil name", "evil%PATH%", "evil&whoami", "fail:fixture", "hang:fixture", "marker:fixture", "redact:fixture", "spawn:fixture", "test", "test:fixture"]);
   assert.ok(result.evidence.some((item) => item.path === "direction-approved.md"));
+  assert.deepEqual(result.remote, { name: "origin", url: "https://github.com/student/example-portfolio.git" });
+  assert.equal(result.worktreeStatus.clean, true);
+  assert.match(result.worktreeStatus.summary, /clean/i);
+  assert.deepEqual(result.sourceDirectories, ["src"]);
+  assert.deepEqual(result.buildDirectories, ["dist"]);
+  assert.ok(result.deploymentHints.includes("GitHub Pages"));
+  assert.ok(result.deploymentHints.includes("static entry: index.html"));
+  assert.ok(result.readmePromises.includes("direct index.html use"));
+  assert.ok(result.readmePromises.includes("GitHub Pages delivery"));
   assert.equal(JSON.stringify(result).includes("证书编号"), false);
+  assert.equal(JSON.stringify(result).includes("github-token"), false);
+  assert.equal(JSON.stringify(result).includes("student:"), false);
 });
 
 test("inspect_project rejects a repository without a commit", async (t) => {
@@ -63,7 +88,8 @@ test("inspect_project rejects a repository without a commit", async (t) => {
   assert.equal(result.ok, false);
 });
 
-test("MCP stdio lists all six guarded workflow tools", async () => {
+test("MCP stdio lists all six tools and calls inspect_project with structured output", async (t) => {
+  const root = await fixtureRepo(t);
   const published = process.env.MCP_SMOKE_PACKAGE;
   const command = published ? (process.platform === "win32" ? "npm.cmd" : "npm") : process.execPath;
   const args = published
@@ -72,9 +98,17 @@ test("MCP stdio lists all six guarded workflow tools", async () => {
   const client = new Client({ name: "smoke", version: "1.0.0" });
   const transport = new StdioClientTransport({ command, args });
   await client.connect(transport);
-  const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch", "run_checks", "commit_changes", "push_changes", "verify_github_pages"]);
-  await client.close();
+  try {
+    const tools = await client.listTools();
+    assert.deepEqual(tools.tools.map((tool) => tool.name), ["inspect_project", "apply_patch", "run_checks", "commit_changes", "push_changes", "verify_github_pages"]);
+    const inspected = await client.callTool({ name: "inspect_project", arguments: { projectPath: root } });
+    assert.equal(inspected.isError, false);
+    assert.equal(inspected.structuredContent.ok, true);
+    assert.equal(inspected.structuredContent.phase, "inspect");
+    assert.equal(inspected.structuredContent.snapshot.repoRoot, root.replaceAll("\\", "/"));
+  } finally {
+    await client.close();
+  }
 });
 
 const readmePatch = [
@@ -139,17 +173,18 @@ test("apply_patch requires allowedPaths to match exactly", async (t) => {
   assert.equal(result.ok, false);
 });
 
-test("apply_patch rejects traversal, git internals, secrets, and symlink escapes", async (t) => {
+test("apply_patch rejects traversal, git internals, credential files, private keys, and symlink escapes", async (t) => {
   const root = await fixtureRepo(t);
   const outside = await mkdtemp(join(tmpdir(), "portfolio-mcp-outside-"));
   t.after(() => rm(outside, { recursive: true, force: true }));
   await symlink(outside, join(root, "linked-outside"), "junction");
   const workflow = createWorkflow();
   const inspected = await workflow.inspectProject({ projectPath: root });
-  for (const path of ["../outside.txt", ".git/config", ".env", "linked-outside/escape.txt"]) {
+  for (const path of ["../outside.txt", ".git/config", ".env", ".npmrc", ".netrc", ".pypirc", "id_ed25519", ".ssh/id_ecdsa", "linked-outside/escape.txt"]) {
     const patch = `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -0,0 +1 @@\n+blocked\n`;
     const result = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch, allowedPaths: [path], mode: "preview" });
     assert.equal(result.ok, false, path);
+    if ([".npmrc", ".netrc", ".pypirc", "id_ed25519", ".ssh/id_ecdsa"].includes(path)) assert.match(result.summary, /protected/, path);
   }
 });
 
@@ -161,6 +196,70 @@ test("apply_patch rejects stale snapshots", async (t) => {
   await writeFile(join(root, "other.txt"), "changed\n");
   const result = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "execute", approvalToken: preview.approvalToken, confirm: "WRITE" });
   assert.equal(result.ok, false);
+});
+
+test("content swaps at one unchanged status path stale every mutating approval", async (t) => {
+  const root = await fixtureRepo(t);
+  await bareRemote(t, root);
+  await writeFile(join(root, "swap.txt"), "first\n");
+  const workflow = createWorkflow();
+
+  let inspected = await workflow.inspectProject({ projectPath: root });
+  const patchPreview = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "preview" });
+  await writeFile(join(root, "swap.txt"), "other\n");
+  const swapped = await workflow.inspectProject({ projectPath: root });
+  assert.notEqual(swapped.snapshot.statusHash, inspected.snapshot.statusHash);
+  const stalePatch = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md"], mode: "execute", approvalToken: patchPreview.approvalToken, confirm: "WRITE" });
+  assert.equal(stalePatch.ok, false);
+  assert.match(stalePatch.summary, /Snapshot is stale/);
+
+  await writeFile(join(root, "swap.txt"), "first\n");
+  inspected = await workflow.inspectProject({ projectPath: root });
+  const checksPreview = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["redact:fixture"], mode: "preview" });
+  await writeFile(join(root, "swap.txt"), "other\n");
+  const staleChecks = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["redact:fixture"], mode: "execute", approvalToken: checksPreview.approvalToken, confirm: "RUN" });
+  assert.equal(staleChecks.ok, false);
+  assert.match(staleChecks.summary, /Snapshot is stale/);
+
+  await writeFile(join(root, "swap.txt"), "first\n");
+  await writeFile(join(root, "README.md"), "Serve index.html locally.\n");
+  inspected = await workflow.inspectProject({ projectPath: root });
+  const commitPreview = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "preview" });
+  await writeFile(join(root, "swap.txt"), "other\n");
+  const staleCommit = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["README.md"], message: "docs: update readme", mode: "execute", approvalToken: commitPreview.approvalToken, confirm: "COMMIT" });
+  assert.equal(staleCommit.ok, false);
+  assert.match(staleCommit.summary, /Snapshot is stale/);
+
+  await writeFile(join(root, "swap.txt"), "first\n");
+  inspected = await workflow.inspectProject({ projectPath: root });
+  const pushPreview = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "preview" });
+  await writeFile(join(root, "swap.txt"), "other\n");
+  const stalePush = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "execute", approvalToken: pushPreview.approvalToken, confirm: "PUSH" });
+  assert.equal(stalePush.ok, false);
+  assert.match(stalePush.summary, /Snapshot is stale/);
+});
+
+test("snapshot fingerprints are deterministic and detect tracked, staged, and untracked content swaps", async (t) => {
+  const root = await fixtureRepo(t);
+  const workflow = createWorkflow();
+
+  await writeFile(join(root, "swap.txt"), "first\n");
+  const untracked = await workflow.inspectProject({ projectPath: root });
+  assert.equal((await workflow.inspectProject({ projectPath: root })).snapshot.statusHash, untracked.snapshot.statusHash);
+  await writeFile(join(root, "swap.txt"), "other\n");
+  assert.notEqual((await workflow.inspectProject({ projectPath: root })).snapshot.statusHash, untracked.snapshot.statusHash);
+  await rm(join(root, "swap.txt"));
+
+  await writeFile(join(root, "README.md"), "Tracked one\n");
+  const tracked = await workflow.inspectProject({ projectPath: root });
+  await writeFile(join(root, "README.md"), "Tracked two\n");
+  assert.notEqual((await workflow.inspectProject({ projectPath: root })).snapshot.statusHash, tracked.snapshot.statusHash);
+
+  await execFileAsync("git", ["add", "README.md"], { cwd: root });
+  const staged = await workflow.inspectProject({ projectPath: root });
+  await writeFile(join(root, "README.md"), "Tracked one\n");
+  await execFileAsync("git", ["add", "README.md"], { cwd: root });
+  assert.notEqual((await workflow.inspectProject({ projectPath: root })).snapshot.statusHash, staged.snapshot.statusHash);
 });
 
 test("apply_patch expires approvals and consumes failed execute attempts", async (t) => {
@@ -201,7 +300,8 @@ test("apply_patch rejects absolute paths and supports quoted rename paths", asyn
   const { stdout } = await execFileAsync("git", ["diff", "--cached", "-M"], { cwd: root });
   const renamePatch = stdout.replace("diff --git a/README.md b/README renamed.md", 'diff --git "a/README.md" "b/README renamed.md"');
   await execFileAsync("git", ["reset", "--hard"], { cwd: root });
-  const renamePreview = await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: renamePatch, allowedPaths: ["README.md", "README renamed.md"], mode: "preview" });
+  const reset = await workflow.inspectProject({ projectPath: root });
+  const renamePreview = await workflow.applyPatch({ projectPath: root, snapshot: reset.snapshot, patch: renamePatch, allowedPaths: ["README.md", "README renamed.md"], mode: "preview" });
   assert.equal(renamePreview.ok, true, renamePreview.summary);
 });
 
@@ -232,8 +332,9 @@ test("apply_patch decodes quoted UTF-8 paths without accepting mojibake", async 
   await writeFile(join(root, filename), "two\n");
   const { stdout: unicodePatch } = await execFileAsync("git", ["diff"], { cwd: root });
   await execFileAsync("git", ["reset", "--hard"], { cwd: root });
-  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: unicodePatch, allowedPaths: [filename], mode: "preview" })).ok, true);
-  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: unicodePatch, allowedPaths: ["æµ‹è¯•.md"], mode: "preview" })).ok, false);
+  const reset = await workflow.inspectProject({ projectPath: root });
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: reset.snapshot, patch: unicodePatch, allowedPaths: [filename], mode: "preview" })).ok, true);
+  assert.equal((await workflow.applyPatch({ projectPath: root, snapshot: reset.snapshot, patch: unicodePatch, allowedPaths: ["æµ‹è¯•.md"], mode: "preview" })).ok, false);
 });
 
 test("run_checks previews allowlisted scripts and executes once with RUN approval", async (t) => {
@@ -253,6 +354,61 @@ test("run_checks previews allowlisted scripts and executes once with RUN approva
   assert.equal((await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "execute", approvalToken: previewAgain.approvalToken, confirm: "RUN" })).ok, false);
 });
 
+test("run_checks rejects option-like and shell-metacharacter script names before preview", async (t) => {
+  const root = await fixtureRepo(t);
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  for (const script of ["-option", "evil&whoami", "evil%PATH%", "evil name"]) {
+    const result = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: [script], mode: "preview" });
+    assert.equal(result.ok, false, script);
+    assert.match(result.summary, /safe package script name/, script);
+  }
+});
+
+test("run_checks does not execute a repository-local npm.cmd on Windows", { skip: process.platform !== "win32" }, async (t) => {
+  const root = await fixtureRepo(t);
+  await writeFile(join(root, "npm.cmd"), "@echo off\r\n>shadow-ran.txt echo shadow\r\nexit /b 0\r\n");
+  const calls = [];
+  const workflow = createWorkflow({ run: async (command, args, options) => {
+    calls.push([command, args]);
+    return runCommand(command, args, options);
+  } });
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "preview" });
+  assert.equal(preview.ok, true, preview.summary);
+  const executed = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["test:fixture"], mode: "execute", approvalToken: preview.approvalToken, confirm: "RUN" });
+  assert.equal(executed.ok, true, executed.summary);
+  assert.equal(await readFile(join(root, "checked.txt"), "utf8"), "ok");
+  await assert.rejects(readFile(join(root, "shadow-ran.txt"), "utf8"));
+  const npmCall = calls.find(([, args]) => args[0] === "run");
+  assert.equal(isAbsolute(npmCall[0]), true);
+  assert.equal(relative(root, npmCall[0]).split(/[\\/]/)[0], "..");
+});
+
+test("run_checks rejects a package.json symlink that escapes the repository", async (t) => {
+  const root = await fixtureRepo(t);
+  const outside = await mkdtemp(join(tmpdir(), "portfolio-mcp-package-outside-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  const outsidePackage = join(outside, "package.json");
+  await writeFile(outsidePackage, JSON.stringify({ scripts: { outside: "node -e \"process.exit(0)\"" } }));
+  await unlink(join(root, "package.json"));
+  try {
+    await symlink(outsidePackage, join(root, "package.json"), "file");
+  } catch (error) {
+    if (error.code === "EPERM") {
+      t.skip("file symlinks require Windows Developer Mode");
+      return;
+    }
+    throw error;
+  }
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  assert.equal(inspected.ok, true, inspected.summary);
+  const result = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["outside"], mode: "preview" });
+  assert.equal(result.ok, false);
+  assert.match(result.summary, /escapes the repository/);
+});
+
 test("run_checks rejects duplicates, times out, stops on failure, and redacts output", async (t) => {
   const root = await fixtureRepo(t);
   const workflow = createWorkflow();
@@ -263,6 +419,10 @@ test("run_checks rejects duplicates, times out, stops on failure, and redacts ou
   const redacted = await workflow.runChecks({ projectPath: root, snapshot: inspected.snapshot, scripts: ["redact:fixture"], mode: "execute", approvalToken: redact.approvalToken, confirm: "RUN" });
   assert.equal(redacted.ok, true, JSON.stringify(redacted));
   assert.match(redacted.evidence[0].stdout, /TOKEN=\[REDACTED\]/);
+  for (const secret of ["secret-value", "api-value", "github-value", "aws-value", "bearer-value", "npm-value", "session-value", "session-cookie", "user:pass"]) assert.equal(JSON.stringify(redacted).includes(secret), false, secret);
+  for (const name of ["API_KEY", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "_authToken", "SESSION_ID", "COOKIE"]) assert.match(redacted.evidence[0].stdout, new RegExp(`${name}[:=]\\[REDACTED\\]`, "i"));
+  assert.match(redacted.evidence[0].stdout, /Authorization: \[REDACTED\]/i);
+  assert.match(redacted.evidence[0].stdout, /https:\/\/\[REDACTED\]@example\.invalid\/repo\.git/);
   const fresh = await workflow.inspectProject({ projectPath: root });
   const timeout = await workflow.runChecks({ projectPath: root, snapshot: fresh.snapshot, scripts: ["hang:fixture"], mode: "preview" });
   const timedOut = await workflow.runChecks({ projectPath: root, snapshot: fresh.snapshot, scripts: ["hang:fixture"], mode: "execute", approvalToken: timeout.approvalToken, confirm: "RUN", timeoutSeconds: 0.05 });
@@ -293,6 +453,17 @@ test("run_checks timeout returns promptly and kills spawned work", async (t) => 
   assert.ok(Date.now() - started < 3_000);
   await new Promise((resolve) => setTimeout(resolve, 700));
   await assert.rejects(readFile(join(root, "after-timeout.txt"), "utf8"));
+});
+
+test("runCommand escalates to SIGKILL for a SIGTERM-ignoring descendant", { skip: process.platform === "win32" }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "portfolio-mcp-sigkill-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const marker = join(root, "sigterm-survived.txt");
+  const descendant = `process.on('SIGTERM',()=>{});setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'ran'),600);setTimeout(()=>{},5000)`;
+  const parent = `const {spawn}=require('node:child_process');spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});process.on('SIGTERM',()=>{});setTimeout(()=>{},5000)`;
+  await assert.rejects(runCommand(process.execPath, ["-e", parent], { cwd: root, timeoutMs: 50 }), /timed out/);
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  await assert.rejects(readFile(marker, "utf8"));
 });
 
 test("commit_changes previews and commits only explicit paths", async (t) => {
@@ -326,6 +497,22 @@ test("commit_changes rejects invalid scope and messages", async (t) => {
     { paths: ["../outside.txt"], message: "docs: update readme" }
   ]) {
     assert.equal((await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, ...input, mode: "preview" })).ok, false);
+  }
+});
+
+test("commit_changes rejects credential files and private-key basenames", async (t) => {
+  const root = await fixtureRepo(t);
+  await mkdir(join(root, ".ssh"));
+  await mkdir(join(root, ".docker"));
+  await mkdir(join(root, ".kube"));
+  const paths = [".npmrc", ".netrc", ".pypirc", ".authinfo", "_netrc", ".htpasswd", ".yarnrc.yml", "id_ed25519", "id_rsa.pub", ".ssh/id_ecdsa", "client.p12", "client.pfx", ".docker/config.json", ".kube/config", "service-account.json"];
+  for (const path of paths) await writeFile(join(root, path), "credential material\n");
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  for (const path of paths) {
+    const result = await workflow.commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: [path], message: "test: protected path", mode: "preview" });
+    assert.equal(result.ok, false, path);
+    assert.match(result.summary, /protected/, path);
   }
 });
 
@@ -391,7 +578,11 @@ async function bareRemote(t, root) {
 test("push_changes previews then pushes HEAD to the configured bare remote once", async (t) => {
   const root = await fixtureRepo(t);
   const remoteRoot = await bareRemote(t, root);
-  const workflow = createWorkflow();
+  const calls = [];
+  const workflow = createWorkflow({ run: async (command, args, options) => {
+    calls.push([command, args]);
+    return runCommand(command, args, options);
+  } });
   const inspected = await workflow.inspectProject({ projectPath: root });
   const preview = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "preview" });
   assert.equal(preview.ok, true, JSON.stringify(preview));
@@ -400,6 +591,8 @@ test("push_changes previews then pushes HEAD to the configured bare remote once"
   assert.equal(executed.ok, true, JSON.stringify(executed));
   assert.equal(executed.evidence[0].refspec, "HEAD:refs/heads/main");
   assert.equal(executed.evidence[0].remoteHead, (await execFileAsync("git", ["--git-dir", remoteRoot, "rev-parse", "refs/heads/main"])).stdout.trim());
+  const pushCall = calls.find(([command, args]) => command === "git" && args[2] === "push");
+  assert.deepEqual(pushCall[1].slice(2), ["push", "--", remoteRoot, "HEAD:refs/heads/main"]);
   assert.equal((await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "execute", approvalToken: preview.approvalToken, confirm: "PUSH" })).ok, false);
 });
 
@@ -444,6 +637,48 @@ test("push_changes binds and reports the configured push URL", async (t) => {
   assert.equal(executed.evidence[0].pushUrl, replacementPushRemote);
 });
 
+test("push_changes rejects a remote configured with multiple push destinations", async (t) => {
+  const root = await fixtureRepo(t);
+  const first = await bareRemote(t, root);
+  const second = await mkdtemp(join(tmpdir(), "portfolio-mcp-second-push-"));
+  t.after(() => rm(second, { recursive: true, force: true }));
+  await execFileAsync("git", ["init", "--bare", second]);
+  await execFileAsync("git", ["remote", "set-url", "--push", "origin", first], { cwd: root });
+  await execFileAsync("git", ["remote", "set-url", "--add", "--push", "origin", second], { cwd: root });
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const result = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "origin", branch: "main", mode: "preview" });
+  assert.equal(result.ok, false);
+  assert.match(result.summary, /exactly one push URL/);
+});
+
+test("push_changes redacts credentials from approved URL evidence", async (t) => {
+  const root = await fixtureRepo(t);
+  await execFileAsync("git", ["remote", "add", "secure", "https://alice:supersecret@example.invalid/portfolio.git"], { cwd: root });
+  const workflow = createWorkflow();
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "secure", branch: "main", mode: "preview" });
+  assert.equal(preview.ok, true, preview.summary);
+  assert.equal(preview.evidence[0].pushUrl, "https://[REDACTED]@example.invalid/portfolio.git");
+  assert.equal(JSON.stringify(preview).includes("alice"), false);
+  assert.equal(JSON.stringify(preview).includes("supersecret"), false);
+});
+
+test("push_changes redacts credentials from Git failure output", async (t) => {
+  const root = await fixtureRepo(t);
+  await execFileAsync("git", ["remote", "add", "secure", "https://alice:supersecret@example.invalid/portfolio.git"], { cwd: root });
+  const workflow = createWorkflow({ run: async (command, args, options) => {
+    if (command === "git" && args[2] === "push") return { code: 1, stdout: "", stderr: "fatal: https://alice:supersecret@example.invalid/portfolio.git rejected\n" };
+    return runCommand(command, args, options);
+  } });
+  const inspected = await workflow.inspectProject({ projectPath: root });
+  const preview = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "secure", branch: "main", mode: "preview" });
+  const result = await workflow.pushChanges({ projectPath: root, snapshot: inspected.snapshot, remote: "secure", branch: "main", mode: "execute", approvalToken: preview.approvalToken, confirm: "PUSH" });
+  assert.equal(result.ok, false);
+  assert.equal(result.summary.includes("alice"), false);
+  assert.equal(result.summary.includes("supersecret"), false);
+});
+
 async function githubRemote(t, root) {
   await execFileAsync("git", ["remote", "add", "origin", "git@github.com:student/example-portfolio.git"], { cwd: root });
   return (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout.trim();
@@ -468,6 +703,7 @@ function staticPagesRun(head, status = "built", remoteUrl = "git@github.com:stud
     if (operation === "rev-parse") return { code: 0, stdout: args[3] === "--show-toplevel" ? "C:/portfolio\n" : `${head}\n`, stderr: "" };
     if (operation === "branch") return { code: 0, stdout: "main\n", stderr: "" };
     if (operation === "status") return { code: 0, stdout: "", stderr: "" };
+    if (operation === "ls-files") return { code: 0, stdout: "", stderr: "" };
     if (operation === "config") return { code: 0, stdout: "origin\n", stderr: "" };
     if (operation === "remote") return { code: 0, stdout: `${remoteUrl}\n`, stderr: "" };
     if (operation === "ls-remote") return { code: 0, stdout: `${head}\trefs/heads/main\n`, stderr: "" };
@@ -475,11 +711,13 @@ function staticPagesRun(head, status = "built", remoteUrl = "git@github.com:stud
   };
 }
 
+const publicLookup = async () => [{ address: "93.184.216.34", family: 4 }];
+
 test("verify_github_pages fully verifies a synchronized GitHub Pages site and expected text", async (t) => {
   const root = await fixtureRepo(t);
   const head = await githubRemote(t, root);
   const fetchImpl = async () => ({ ok: true, status: 200, text: async () => "Expected portfolio title" });
-  const result = await createWorkflow({ run: pagesRun(head), fetchImpl }).verifyGithubPages({
+  const result = await createWorkflow({ run: pagesRun(head), fetchImpl, lookupImpl: publicLookup }).verifyGithubPages({
     projectPath: root,
     publicUrl: "https://example.invalid/portfolio/",
     expectedText: "Expected portfolio title",
@@ -497,7 +735,7 @@ test("verify_github_pages reports partial when gh is unavailable but HTTP succee
     if (command === "gh") throw new Error("gh unavailable");
     return runCommand(command, args, options);
   };
-  const result = await createWorkflow({ run: unavailableGh, fetchImpl: async () => ({ ok: true, status: 200, text: async () => "live" }) }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/" });
+  const result = await createWorkflow({ run: unavailableGh, fetchImpl: async () => ({ ok: true, status: 200, text: async () => "live" }), lookupImpl: publicLookup }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/" });
   assert.equal(result.ok, true, result.summary);
   assert.equal(result.verification, "partial");
 });
@@ -505,7 +743,7 @@ test("verify_github_pages reports partial when gh is unavailable but HTTP succee
 test("verify_github_pages fails when the remote branch is not at local HEAD", async (t) => {
   const root = await fixtureRepo(t);
   await githubRemote(t, root);
-  const result = await createWorkflow({ run: pagesRun("0".repeat(40)), fetchImpl: async () => ({ ok: true, status: 200, text: async () => "live" }) }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/" });
+  const result = await createWorkflow({ run: pagesRun("0".repeat(40)), fetchImpl: async () => ({ ok: true, status: 200, text: async () => "live" }), lookupImpl: publicLookup }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/" });
   assert.equal(result.ok, false);
   assert.equal(result.verification, "failed");
 });
@@ -513,10 +751,10 @@ test("verify_github_pages fails when the remote branch is not at local HEAD", as
 test("verify_github_pages fails for unsuccessful HTTP or missing expected text", async (t) => {
   const root = await fixtureRepo(t);
   const head = await githubRemote(t, root);
-  const workflow = createWorkflow({ run: pagesRun(head), fetchImpl: async () => ({ ok: false, status: 503, text: async () => "offline" }) });
+  const workflow = createWorkflow({ run: pagesRun(head), fetchImpl: async () => ({ ok: false, status: 503, text: async () => "offline" }), lookupImpl: publicLookup });
   const unavailable = await workflow.verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/" });
   assert.equal(unavailable.verification, "failed");
-  const missingText = await createWorkflow({ run: pagesRun(head), fetchImpl: async () => ({ ok: true, status: 200, text: async () => "other page" }) }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/", expectedText: "Expected title" });
+  const missingText = await createWorkflow({ run: pagesRun(head), fetchImpl: async () => ({ ok: true, status: 200, text: async () => "other page" }), lookupImpl: publicLookup }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/", expectedText: "Expected title" });
   assert.equal(missingText.verification, "failed");
 });
 
@@ -524,7 +762,7 @@ test("verify_github_pages aborts a non-settling public URL fetch at the timeout"
   const head = "1".repeat(40);
   let aborted = false;
   const fetchImpl = (_, { signal }) => new Promise(() => signal.addEventListener("abort", () => { aborted = true; }));
-  const result = await createWorkflow({ run: staticPagesRun(head), fetchImpl }).verifyGithubPages({ projectPath: "C:/portfolio", publicUrl: "https://example.invalid/", timeoutSeconds: 0.02 });
+  const result = await createWorkflow({ run: staticPagesRun(head), fetchImpl, lookupImpl: publicLookup }).verifyGithubPages({ projectPath: "C:/portfolio", publicUrl: "https://example.invalid/", timeoutSeconds: 0.02 });
   assert.equal(result.verification, "timeout");
   assert.equal(aborted, true);
 });
@@ -565,4 +803,67 @@ test("verify_github_pages times out while Pages remains building", async () => {
   const result = await createWorkflow({ run: staticPagesRun(head, "building"), fetchImpl: async () => ({ ok: true, status: 200, text: async () => "live" }) }).verifyGithubPages({ projectPath: "C:/portfolio", publicUrl: "https://example.invalid/", timeoutSeconds: 0.02 });
   assert.equal(result.ok, false);
   assert.equal(result.verification, "timeout");
+});
+
+test("verify_github_pages rejects loopback and private DNS targets before fetch", async (t) => {
+  const root = await fixtureRepo(t);
+  const head = await githubRemote(t, root);
+  let fetchCalls = 0;
+  const fetchImpl = async () => {
+    fetchCalls += 1;
+    return { ok: true, status: 200, text: async () => "live" };
+  };
+  const loopback = await createWorkflow({ run: pagesRun(head), fetchImpl, lookupImpl: publicLookup }).verifyGithubPages({ projectPath: root, publicUrl: "http://127.0.0.1/" });
+  assert.equal(loopback.verification, "failed");
+  assert.match(loopback.summary, /public address/);
+  const privateDns = await createWorkflow({ run: pagesRun(head), fetchImpl, lookupImpl: async () => [{ address: "10.0.0.4", family: 4 }] }).verifyGithubPages({ projectPath: root, publicUrl: "https://internal.example/" });
+  assert.equal(privateDns.verification, "failed");
+  assert.match(privateDns.summary, /public address/);
+  assert.equal(fetchCalls, 0);
+});
+
+test("verify_github_pages validates a redirect target before following it", async (t) => {
+  const root = await fixtureRepo(t);
+  const head = await githubRemote(t, root);
+  const fetched = [];
+  const resolved = [];
+  const fetchImpl = async (url, options) => {
+    fetched.push([url, options.redirect]);
+    return { ok: false, status: 302, headers: { get: () => "https://private.example/secret" }, text: async () => "" };
+  };
+  const lookupImpl = async (hostname) => {
+    resolved.push(hostname);
+    return [{ address: hostname === "private.example" ? "192.168.1.4" : "93.184.216.34", family: 4 }];
+  };
+  const result = await createWorkflow({ run: pagesRun(head), fetchImpl, lookupImpl }).verifyGithubPages({ projectPath: root, publicUrl: "https://safe.example/" });
+  assert.equal(result.verification, "failed");
+  assert.match(result.summary, /public address/);
+  assert.deepEqual(fetched, [["https://safe.example/", "manual"]]);
+  assert.deepEqual(resolved, ["safe.example", "private.example"]);
+});
+
+test("verify_github_pages follows a validated relative redirect manually", async (t) => {
+  const root = await fixtureRepo(t);
+  const head = await githubRemote(t, root);
+  const fetched = [];
+  const fetchImpl = async (url, options) => {
+    fetched.push([url, options.redirect]);
+    if (url === "https://safe.example/start") {
+      return { ok: false, status: 302, headers: { get: (name) => name.toLowerCase() === "location" ? "/portfolio/" : null }, text: async () => "" };
+    }
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => "Expected portfolio title" };
+  };
+  const result = await createWorkflow({ run: pagesRun(head), fetchImpl, lookupImpl: publicLookup }).verifyGithubPages({ projectPath: root, publicUrl: "https://safe.example/start", expectedText: "Expected portfolio title" });
+  assert.equal(result.verification, "full", result.summary);
+  assert.deepEqual(fetched, [["https://safe.example/start", "manual"], ["https://safe.example/portfolio/", "manual"]]);
+  assert.equal(result.evidence.at(-1).publicUrl, "https://safe.example/portfolio/");
+});
+
+test("verify_github_pages rejects an oversized response body", async (t) => {
+  const root = await fixtureRepo(t);
+  const head = await githubRemote(t, root);
+  const fetchImpl = async () => ({ ok: true, status: 200, text: async () => "x".repeat(1_048_577) });
+  const result = await createWorkflow({ run: pagesRun(head), fetchImpl, lookupImpl: publicLookup }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/" });
+  assert.equal(result.verification, "failed");
+  assert.match(result.summary, /response body is too large/);
 });

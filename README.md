@@ -35,6 +35,44 @@ The server exposes exactly six tools:
 
 The MCP host approval prompt remains the final authority. The server never authenticates npm or GitHub Pages: use your host, npm, Git, and GitHub CLI sign-in flows where needed.
 
+## Preview and execute
+
+Start with `inspect_project` and copy its snapshot unchanged into the next tool call. For example, preview two package checks:
+
+```json
+{
+  "projectPath": "C:\\path\\to\\portfolio",
+  "snapshot": {
+    "repoRoot": "C:/path/to/portfolio",
+    "head": "<head from inspect_project>",
+    "branch": "main",
+    "statusHash": "<statusHash from inspect_project>"
+  },
+  "scripts": ["test", "build"],
+  "mode": "preview"
+}
+```
+
+After reviewing the preview, repeat the same request with the returned token:
+
+```json
+{
+  "projectPath": "C:\\path\\to\\portfolio",
+  "snapshot": {
+    "repoRoot": "C:/path/to/portfolio",
+    "head": "<same inspected head>",
+    "branch": "main",
+    "statusHash": "<same inspected statusHash>"
+  },
+  "scripts": ["test", "build"],
+  "mode": "execute",
+  "approvalToken": "<token from preview>",
+  "confirm": "RUN"
+}
+```
+
+Tokens are single-use. If the repository or arguments change, inspect and preview again.
+
 ## Connect a host
 
 ### Codex
@@ -93,6 +131,22 @@ Add this row to the active Harness profile or overlay:
 
 DeepSeek Harness exposes these as `mcp__student_portfolio__*`. See the [DeepSeek Harness official MCP client](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/mcp/mcp-client/README.md).
 
+## Troubleshooting
+
+- **`npx` is missing or cannot start the server:** run `node --version` and `npm --version`; install Node.js 18 or later and reopen the terminal if either command is unavailable. Use `npm view student-portfolio-website-mcp version` to distinguish registry/network access from MCP client configuration.
+- **npm asks for authentication:** the public package does not require login to run. For publishing or a registry that requires an account, check `npm whoami`, then use `npm login`; the MCP never receives npm credentials.
+- **Git push reports missing credentials:** verify the repository with `git -C C:\path\to\portfolio remote -v` and `git -C C:\path\to\portfolio ls-remote origin`. Authenticate Git normally (for GitHub CLI, `gh auth login` followed by `gh auth setup-git`) and preview `push_changes` again. Do not put tokens in tool input or remote URLs.
+- **Pages verification is `partial`:** the branch or live URL check succeeded, but either no public URL was supplied or GitHub Pages build status was unavailable. Run `gh auth status`, restore repository/Pages access if needed, provide the public URL, and retry. `partial` is not proof that the Pages build completed.
+
 ## Optional skill
 
-Clients that support skills can also install `building-student-portfolio-websites/SKILL.md`. It supplies the project-specific judgment around confirmed designs, privacy, responsive motion, and separate edit/commit/push/deployment authority; the MCP tools carry out the guarded operations when available.
+Clients that support skills can also install `building-student-portfolio-websites/SKILL.md`. With the package installed globally, copy it into Codex's user skill directory in PowerShell:
+
+```powershell
+$skillSource = Join-Path (npm root -g) "student-portfolio-website-mcp\building-student-portfolio-websites"
+$skillParent = Join-Path $env:USERPROFILE ".codex\skills"
+New-Item -ItemType Directory -Force $skillParent | Out-Null
+Copy-Item $skillSource $skillParent -Recurse -Force
+```
+
+Restart the client after installation. For another skill-capable client, copy the same folder to that client's documented skills directory. The skill supplies project-specific judgment around confirmed designs, privacy, responsive motion, and separate edit/commit/push/deployment authority; the MCP tools carry out the guarded operations when available.

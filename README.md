@@ -156,4 +156,4 @@ Restart the client after installation. For another skill-capable client, copy th
 
 
 
-Forum：https://linux.do
+Demo:zyp2026.com

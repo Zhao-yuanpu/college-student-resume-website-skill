@@ -822,6 +822,23 @@ test("verify_github_pages rejects loopback and private DNS targets before fetch"
   assert.equal(fetchCalls, 0);
 });
 
+test("verify_github_pages rejects deprecated IPv6 site-local targets before fetch", async (t) => {
+  const root = await fixtureRepo(t);
+  const head = await githubRemote(t, root);
+  let fetchCalls = 0;
+  const fetchImpl = async () => {
+    fetchCalls += 1;
+    return { ok: true, status: 200, text: async () => "live" };
+  };
+  const directLiteral = await createWorkflow({ run: pagesRun(head), fetchImpl }).verifyGithubPages({ projectPath: root, publicUrl: "http://[fec0::1]/" });
+  assert.equal(directLiteral.verification, "failed");
+  assert.match(directLiteral.summary, /public address/);
+  const dnsTarget = await createWorkflow({ run: pagesRun(head), fetchImpl, lookupImpl: async () => [{ address: "fec0::1", family: 6 }] }).verifyGithubPages({ projectPath: root, publicUrl: "https://site-local.example/" });
+  assert.equal(dnsTarget.verification, "failed");
+  assert.match(dnsTarget.summary, /public address/);
+  assert.equal(fetchCalls, 0);
+});
+
 test("verify_github_pages validates a redirect target before following it", async (t) => {
   const root = await fixtureRepo(t);
   const head = await githubRemote(t, root);

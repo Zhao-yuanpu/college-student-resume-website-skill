@@ -153,7 +153,5 @@ Copy-Item $skillSource $skillParent -Recurse -Force
 
 Restart the client after installation. For another skill-capable client, copy the same folder to that client's documented skills directory. The skill supplies project-specific judgment around confirmed designs, privacy, responsive motion, and separate edit/commit/push/deployment authority; the MCP tools carry out the guarded operations when available.
 
-
-
-
-Demo:zyp2026.com
+## Demo
+[personal website demo](https://zyp2026.com/)

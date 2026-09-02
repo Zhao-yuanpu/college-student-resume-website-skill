@@ -1,3 +1,5 @@
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 # Student Portfolio Website MCP
 
 `student-portfolio-website-mcp` is a local stdio MCP server for safely working on student portfolio and resume websites. It keeps design judgment with your agent and user, while it inspects projects and performs explicitly approved Git and package-script steps.

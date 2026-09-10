@@ -22,6 +22,24 @@ npm install -g student-portfolio-website-mcp
 student-portfolio-website-mcp
 ```
 
+## Five-minute first run
+
+`npx -y student-portfolio-website-mcp` starts a stdio server for an MCP client, so a terminal may appear to wait without printing a prompt. Verify the installation separately:
+
+```powershell
+npx -y student-portfolio-website-mcp --version
+npx -y student-portfolio-website-mcp --help
+```
+
+The target must already be a local Git repository with at least one commit. For a new website, let your host create the initial files and make the first approved commit, then use this MCP for the guarded workflow.
+
+1. Connect one client using the commands below.
+2. Ask it to call `inspect_project` for the website directory.
+3. Ask for a preview of the next action; review the returned files, snapshot, and next confirmation.
+4. Approve only the matching stage (`WRITE`, `RUN`, `COMMIT`, or `PUSH`).
+
+You can start with: “Inspect this portfolio repository, summarize its constraints and current status, then propose a minimal mobile-friendly resume page. Do not edit anything until I review the preview.” See the [first portfolio task example](examples/first-portfolio-task.md) for a complete fictional walkthrough.
+
 ## Tools and safety
 
 The server exposes exactly six tools:
@@ -152,3 +170,5 @@ Copy-Item $skillSource $skillParent -Recurse -Force
 ```
 
 Restart the client after installation. For another skill-capable client, copy the same folder to that client's documented skills directory. The skill supplies project-specific judgment around confirmed designs, privacy, responsive motion, and separate edit/commit/push/deployment authority; the MCP tools carry out the guarded operations when available.
+
+The MCP supplies guarded project operations; the skill supplies the website-making method. Clients that do not support installing skills can still use the MCP and paste the workflow prompt from the example above. The skill file is also available at [`building-student-portfolio-websites/SKILL.md`](building-student-portfolio-websites/SKILL.md).

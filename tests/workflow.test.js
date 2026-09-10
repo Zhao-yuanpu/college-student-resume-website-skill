@@ -21,7 +21,8 @@ test("CLI help lists the guarded workflow tools and confirmations", async () => 
 
 test("CLI version reads package metadata", async () => {
   const { stdout } = await execFileAsync(process.execPath, ["src/index.js", "--version"], { cwd: process.cwd() });
-  assert.equal(stdout, "1.0.0\n");
+  const packageJson = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8"));
+  assert.equal(stdout, `${packageJson.version}\n`);
 });
 
 test("tool text content includes structured data for text-only MCP hosts", () => {

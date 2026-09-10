@@ -22,6 +22,24 @@ npm install -g student-portfolio-website-mcp
 student-portfolio-website-mcp
 ```
 
+## 5 分钟完成第一次使用
+
+`npx -y student-portfolio-website-mcp` 会为 MCP 客户端启动 stdio 服务器，因此直接在终端运行时没有提示符属于正常现象。请单独验证安装结果：
+
+```powershell
+npx -y student-portfolio-website-mcp --version
+npx -y student-portfolio-website-mcp --help
+```
+
+目标必须是已经存在且至少有一个提交的本地 Git 仓库。制作全新网站时，先让客户端创建初始文件并完成第一次授权提交，再把后续受控修改交给本 MCP。
+
+1. 使用下面的命令连接一个客户端。
+2. 让客户端对网站目录调用 `inspect_project`。
+3. 要求它预览下一步操作，检查返回的文件、快照和下一阶段确认词。
+4. 只批准对应阶段的确认词：`WRITE`、`RUN`、`COMMIT` 或 `PUSH`。
+
+可以直接复制这句话开始：“检查这个个人简历网站仓库，总结约束和当前状态，然后提出一个适合手机浏览的最小简历页面方案。在我查看预览前不要修改文件。” 完整的虚构示例见 [第一次制作个人网站](examples/first-portfolio-task.md)。
+
 ## 工具与安全机制
 
 服务器一共提供六个工具：
@@ -156,3 +174,5 @@ Copy-Item $skillSource $skillParent -Recurse -Force
 ```
 
 安装后重启客户端。对于其他支持技能的客户端，请将同一个文件夹复制到该客户端文档指定的技能目录。该技能提供已确认设计、隐私、响应式动效，以及编辑/提交/推送/部署权限分离方面的项目判断；可用时由 MCP 工具执行受保护的操作。
+
+MCP 负责受保护的项目操作，skill 负责网页制作方法。不支持安装 skill 的客户端仍可使用 MCP，并直接复制上面的任务提示。skill 文件也可以直接查看：[`building-student-portfolio-websites/SKILL.md`](building-student-portfolio-websites/SKILL.md)。

@@ -176,3 +176,6 @@ Copy-Item $skillSource $skillParent -Recurse -Force
 安装后重启客户端。对于其他支持技能的客户端，请将同一个文件夹复制到该客户端文档指定的技能目录。该技能提供已确认设计、隐私、响应式动效，以及编辑/提交/推送/部署权限分离方面的项目判断；可用时由 MCP 工具执行受保护的操作。
 
 MCP 负责受保护的项目操作，skill 负责网页制作方法。不支持安装 skill 的客户端仍可使用 MCP，并直接复制上面的任务提示。skill 文件也可以直接查看：[`building-student-portfolio-websites/SKILL.md`](building-student-portfolio-websites/SKILL.md)。
+
+## 示例
+[个人网站案例](https://zyp2026.com/)

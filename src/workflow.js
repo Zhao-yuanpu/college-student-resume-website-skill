@@ -340,6 +340,15 @@ function gitPathToken(input, start) {
 function patchPaths(patch) {
   const paths = [];
   for (const line of patch.split("\n")) {
+    if (line.startsWith("--- ") || line.startsWith("+++ ")) {
+      const marker = line.slice(4).trimStart();
+      const path = marker.startsWith('"') ? gitPathToken(marker, 0).path : marker.split("\t", 1)[0].trim();
+      if (path !== "/dev/null") {
+        const prefix = line.startsWith("--- ") ? "a/" : "b/";
+        paths.push(path.startsWith(prefix) ? path.slice(2) : path);
+      }
+      continue;
+    }
     if (!line.startsWith("diff --git ")) continue;
     const input = line.slice("diff --git ".length);
     let oldPath;
@@ -518,7 +527,15 @@ async function commitChanges({ projectPath, snapshot: requestedSnapshot, paths, 
     if (!Array.isArray(paths) || paths.length === 0) throw new Error("paths must be a non-empty list");
     const allowed = paths.map(safePath).sort();
     if (new Set(allowed).size !== allowed.length) throw new Error("paths must not contain duplicates");
-    for (const path of allowed) await assertInsideRoot(current.repoRoot, path);
+    for (const path of allowed) {
+      await assertInsideRoot(current.repoRoot, path);
+      try {
+        const info = await lstat(join(current.repoRoot, path));
+        if (info.isDirectory()) throw new Error("Commit paths must name files, not directories");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    }
     const pathspecs = literalPathspecs(allowed);
     if (typeof message !== "string" || !message.trim() || /[\r\n]/.test(message)) throw new Error("message must be a nonblank single line");
     const stagedBefore = (await git(run, current.repoRoot, ["diff", "--cached", "--name-only", "-z"])).stdout.split("\0").filter(Boolean).map(safePath);
@@ -526,6 +543,8 @@ async function commitChanges({ projectPath, snapshot: requestedSnapshot, paths, 
     const changed = new Set((await git(run, current.repoRoot, ["diff", "--name-only", "-z", "HEAD", "--", ...pathspecs])).stdout.split("\0").filter(Boolean));
     for (const path of (await git(run, current.repoRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...pathspecs])).stdout.split("\0").filter(Boolean)) changed.add(path);
     if (changed.size === 0) throw new Error("No changes to commit");
+    const changedPaths = [...changed].map(safePath);
+    if (changedPaths.some((path) => !allowed.includes(path))) throw new Error("Git expanded the commit scope beyond the explicit file list");
     const binding = commitBinding(current, allowed, message);
     if (mode === "preview") {
       const token = randomUUIDImpl();
@@ -536,8 +555,9 @@ async function commitChanges({ projectPath, snapshot: requestedSnapshot, paths, 
     if (!approval || approval.operation !== "commit_changes" || approval.expiresAt < now() || approval.bindingHash !== hashJson(binding)) throw new Error("Approval token is invalid, expired, stale, or already used");
     await git(run, current.repoRoot, ["add", "--", ...pathspecs]);
     await git(run, current.repoRoot, ["diff", "--cached", "--check", "--", ...pathspecs]);
-    const staged = (await git(run, current.repoRoot, ["diff", "--cached", "--name-only", "-z", "--", ...pathspecs])).stdout;
-    if (!staged) throw new Error("No staged changes to commit");
+    const stagedPaths = (await git(run, current.repoRoot, ["diff", "--cached", "--name-only", "-z", "--", ...pathspecs])).stdout.split("\0").filter(Boolean).map(safePath);
+    if (stagedPaths.length === 0) throw new Error("No staged changes to commit");
+    if (stagedPaths.some((path) => !allowed.includes(path))) throw new Error("Git staged a path outside the explicit file list");
     await git(run, current.repoRoot, ["commit", "-m", message]);
     const fresh = await snapshot(run, current.repoRoot);
     return { ok: true, phase: "commit", summary: `Committed ${allowed.join(", ")}`, evidence: allowed, head: fresh.head, snapshot: { ...fresh, repoRoot: normalized(fresh.repoRoot) }, nextAction: "Preview the next workflow phase" };
@@ -774,7 +794,7 @@ async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeout
         }
         let build;
         try {
-          build = await run("gh", ["api", `repos/${repository.owner}/${repository.repository}/pages/builds/latest`, "--jq", ".status"], { cwd: current.repoRoot, ...options });
+          build = await run("gh", ["api", `repos/${repository.owner}/${repository.repository}/pages/builds/latest`, "--jq", "{status: .status, commit: .commit} | @json"], { cwd: current.repoRoot, ...options });
         } catch (error) {
           evidence.push({ buildState: "unavailable", reason: redact(error.message) });
           buildUnavailable = true;
@@ -785,9 +805,22 @@ async function verifyGithubPages({ projectPath, publicUrl, expectedText, timeout
           buildUnavailable = true;
           break;
         }
-        const status = build.stdout.trim().toLowerCase();
-        evidence.push({ buildState: status });
-        if (status === "built") break;
+        let buildInfo;
+        try {
+          buildInfo = JSON.parse(build.stdout.trim());
+        } catch {
+          return pagesResult("partial", "GitHub Pages returned an unreadable build record", evidence, "Retry verification after GitHub Pages returns build details");
+        }
+        const status = String(buildInfo.status ?? "").toLowerCase();
+        const buildCommit = typeof buildInfo.commit === "string" ? buildInfo.commit : null;
+        evidence.push({ buildState: status, buildCommit });
+        if (status === "built" && buildCommit === current.head) break;
+        if (status === "built" && buildCommit && buildCommit !== current.head) {
+          const remainingAfterPoll = deadline - Date.now();
+          if (remainingAfterPoll <= 0) return pagesResult("timeout", "Timed out waiting for the current GitHub Pages build", evidence, "Try verification again after the Pages build completes");
+          await wait(Math.min(250, remainingAfterPoll));
+          continue;
+        }
         if (["errored", "error", "failed", "canceled", "cancelled"].includes(status)) return pagesResult("failed", `GitHub Pages build is ${status}`, evidence, "Fix the Pages build, then verify again");
         const remainingAfterPoll = deadline - Date.now();
         if (remainingAfterPoll <= 0) return pagesResult("timeout", "Timed out waiting for GitHub Pages build status", evidence, "Try verification again after the Pages build completes");

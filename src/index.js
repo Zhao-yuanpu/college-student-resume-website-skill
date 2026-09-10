@@ -10,7 +10,7 @@ const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url),
 
 export function toToolResult(result) {
   return {
-    content: [{ type: "text", text: result.summary }],
+    content: [{ type: "text", text: `${result.summary}\n${JSON.stringify(result)}` }],
     structuredContent: result,
     isError: result.ok === false
   };

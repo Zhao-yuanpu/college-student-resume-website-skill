@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createWorkflow, runCommand } from "../src/workflow.js";
+import { toToolResult } from "../src/index.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,6 +22,13 @@ test("CLI help lists the guarded workflow tools and confirmations", async () => 
 test("CLI version reads package metadata", async () => {
   const { stdout } = await execFileAsync(process.execPath, ["src/index.js", "--version"], { cwd: process.cwd() });
   assert.equal(stdout, "1.0.0\n");
+});
+
+test("tool text content includes structured data for text-only MCP hosts", () => {
+  const result = toToolResult({ ok: true, summary: "Preview ready", approvalToken: "token", snapshot: { head: "head" } });
+  const text = result.content[0].text;
+  assert.equal(text.startsWith("Preview ready\n"), true);
+  assert.deepEqual(JSON.parse(text.slice(text.indexOf("\n") + 1)), result.structuredContent);
 });
 
 async function fixtureRepo(t) {
@@ -170,6 +178,26 @@ test("apply_patch requires allowedPaths to match exactly", async (t) => {
   const root = await fixtureRepo(t);
   const inspected = await createWorkflow().inspectProject({ projectPath: root });
   const result = await createWorkflow().applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch: readmePatch, allowedPaths: ["README.md", "README.md"], mode: "preview" });
+  assert.equal(result.ok, false);
+});
+
+test("apply_patch rejects ordinary unified patch files outside the allowed paths", async (t) => {
+  const root = await fixtureRepo(t);
+  const inspected = await createWorkflow().inspectProject({ projectPath: root });
+  const patch = [
+    "diff --git a/README.md b/README.md",
+    "--- a/README.md",
+    "+++ b/README.md",
+    "@@ -1 +1 @@",
+    "-Open index.html directly.",
+    "+Updated README.",
+    "--- a/package.json",
+    "+++ b/package.json",
+    "@@ -1 +1 @@",
+    "-{}",
+    "+{\"changed\":true}"
+  ].join("\n") + "\n";
+  const result = await createWorkflow().applyPatch({ projectPath: root, snapshot: inspected.snapshot, patch, allowedPaths: ["README.md"], mode: "preview" });
   assert.equal(result.ok, false);
 });
 
@@ -553,6 +581,16 @@ test("commit_changes treats pathspec-looking paths literally", async (t) => {
   assert.equal(result.ok, false);
 });
 
+test("commit_changes rejects directory paths", async (t) => {
+  const root = await fixtureRepo(t);
+  await mkdir(join(root, "src"));
+  await writeFile(join(root, "src", ".env"), "SECRET=do-not-commit\n");
+  const inspected = await createWorkflow().inspectProject({ projectPath: root });
+  const result = await createWorkflow().commitChanges({ projectPath: root, snapshot: inspected.snapshot, paths: ["src"], message: "unsafe directory", mode: "preview" });
+  assert.equal(result.ok, false);
+  assert.match(result.summary, /files, not directories/i);
+});
+
 test("commit_changes commits a selected untracked file without touching another", async (t) => {
   const root = await fixtureRepo(t);
   await writeFile(join(root, "new-profile.md"), "new profile\n");
@@ -684,20 +722,20 @@ async function githubRemote(t, root) {
   return (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout.trim();
 }
 
-function pagesRun(head, statuses = ["built"]) {
+function pagesRun(head, statuses = ["built"], buildCommit = head) {
   let statusIndex = 0;
   return async (command, args, options) => {
     if (command === "git" && args.includes("ls-remote")) return { code: 0, stdout: `${head}\trefs/heads/main\n`, stderr: "" };
-    if (command === "gh") return { code: 0, stdout: `${statuses[Math.min(statusIndex++, statuses.length - 1)]}\n`, stderr: "" };
+    if (command === "gh") return { code: 0, stdout: JSON.stringify({ status: statuses[Math.min(statusIndex++, statuses.length - 1)], commit: buildCommit }) + "\n", stderr: "" };
     return runCommand(command, args, options);
   };
 }
 
-function staticPagesRun(head, status = "built", remoteUrl = "git@github.com:student/example-portfolio.git", ghCalls = []) {
+function staticPagesRun(head, status = "built", remoteUrl = "git@github.com:student/example-portfolio.git", ghCalls = [], buildCommit = head) {
   return async (command, args) => {
     if (command === "gh") {
       ghCalls.push(args);
-      return { code: 0, stdout: `${status}\n`, stderr: "" };
+      return { code: 0, stdout: JSON.stringify({ status, commit: buildCommit }) + "\n", stderr: "" };
     }
     const operation = args[2];
     if (operation === "rev-parse") return { code: 0, stdout: args[3] === "--show-toplevel" ? "C:/portfolio\n" : `${head}\n`, stderr: "" };
@@ -776,8 +814,16 @@ test("verify_github_pages uses the exact Pages API path for HTTPS and SSH remote
     const ghCalls = [];
     const result = await createWorkflow({ run: staticPagesRun(head, "built", remoteUrl, ghCalls) }).verifyGithubPages({ projectPath: "C:/portfolio" });
     assert.equal(result.verification, "partial");
-    assert.deepEqual(ghCalls, [["api", `repos/${owner}/${repository}/pages/builds/latest`, "--jq", ".status"]]);
+    assert.deepEqual(ghCalls, [["api", `repos/${owner}/${repository}/pages/builds/latest`, "--jq", "{status: .status, commit: .commit} | @json"]]);
   }
+});
+
+test("verify_github_pages does not accept a built Pages deployment for an older commit", async (t) => {
+  const root = await fixtureRepo(t);
+  const head = await githubRemote(t, root);
+  const oldCommit = "b".repeat(40);
+  const result = await createWorkflow({ run: pagesRun(head, ["built"], oldCommit), fetchImpl: async () => ({ ok: true, status: 200, text: async () => "old page" }), lookupImpl: publicLookup }).verifyGithubPages({ projectPath: root, publicUrl: "https://example.invalid/", timeoutSeconds: 0.02 });
+  assert.equal(result.verification, "timeout");
 });
 
 test("verify_github_pages gives every snapshot command the remaining total deadline", async () => {
